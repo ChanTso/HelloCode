@@ -12,7 +12,7 @@ import { ContextManager } from "./context.js";
 import { WorkspacePaths } from "./paths.js";
 import { PermissionGate, type PermissionMode } from "./permissions.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { SessionStore } from "./session.js";
+import { SessionStore, stripThinkingBlocks } from "./session.js";
 import { createTools, ToolRegistry } from "./tools/index.js";
 import { TerminalUI } from "./ui.js";
 import { VERSION } from "./version.js";
@@ -56,10 +56,11 @@ Options:
   -h, --help                           Show help
 
 Environment:
-  ANTHROPIC_API_KEY     Required Anthropic API key
-  HELLOCODE_MODEL       Default model override
-  HELLOCODE_HOME        Session data directory (default: ~/.hellocode)
-  NO_COLOR              Disable terminal colors
+  ANTHROPIC_API_KEY       Required Anthropic API key
+  HELLOCODE_MODEL         Default model override
+  HELLOCODE_HOME          Session data directory (default: ~/.hellocode)
+  HELLOCODE_CONTEXT_CHARS Approximate context budget (default: 600000)
+  NO_COLOR                Disable terminal colors
 `;
 
 const INTERACTIVE_HELP = `Commands:
@@ -201,6 +202,10 @@ async function resolveConfig(
   if (contextChars < 20_000) {
     throw new Error("HELLOCODE_CONTEXT_CHARS must be at least 20000.");
   }
+  const model = values.model ?? process.env.HELLOCODE_MODEL ?? DEFAULT_MODEL;
+  if (model.trim() === "") {
+    throw new Error("Model ID must not be empty.");
+  }
 
   return {
     apiKey,
@@ -214,7 +219,7 @@ async function resolveConfig(
         : values.plan === true
           ? "plan"
           : "default",
-    model: values.model ?? process.env.HELLOCODE_MODEL ?? DEFAULT_MODEL,
+    model,
     ...(prompt === undefined ? {} : { prompt }),
     save: values["no-save"] !== true,
     workspace: path.resolve(values.cwd ?? process.cwd()),
@@ -237,7 +242,7 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
     model: config.model,
   });
   const agent = new Agent(model, registry, {
-    system: await buildSystemPrompt(paths),
+    system: await buildSystemPrompt(paths, config.mode === "plan"),
     maxTurns: config.maxTurns,
     context: new ContextManager(config.contextChars),
     onEvent: (event) => ui.render(event),
@@ -248,10 +253,18 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
     if (loaded === undefined)
       ui.notice("No previous session found for this workspace.");
     else {
-      agent.restore(loaded.messages);
+      const changedModel = loaded.model !== config.model;
+      agent.restore(
+        changedModel ? stripThinkingBlocks(loaded.messages) : loaded.messages,
+      );
       ui.notice(
         `Resumed session from ${new Date(loaded.updatedAt).toLocaleString()}.`,
       );
+      if (changedModel) {
+        ui.notice(
+          `Removed model-specific reasoning from ${loaded.model} before continuing with ${config.model}.`,
+        );
+      }
     }
   }
   const writableSession = config.save ? sessionStore : undefined;

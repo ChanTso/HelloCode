@@ -3,6 +3,7 @@ import { PassThrough, Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { main } from "../src/cli.js";
+import { VERSION } from "../src/version.js";
 
 const originalApiKey = process.env.ANTHROPIC_API_KEY;
 
@@ -30,7 +31,7 @@ describe.sequential("CLI", () => {
     const code = await main(["--version"], io);
 
     expect(code).toBe(0);
-    expect(io.stdout()).toBe("HelloCode 0.1.0\n");
+    expect(io.stdout()).toBe(`HelloCode ${VERSION}\n`);
   });
 
   it("fails clearly when the API key is missing", async () => {
@@ -54,6 +55,16 @@ describe.sequential("CLI", () => {
 
     expect(code).toBe(2);
     expect(io.stderr()).toContain("cannot be combined");
+  });
+
+  it("rejects an empty model ID during configuration", async () => {
+    process.env.ANTHROPIC_API_KEY = "test";
+    const io = captureIo();
+
+    const code = await main(["--print", "--model", "", "test"], io);
+
+    expect(code).toBe(2);
+    expect(io.stderr()).toContain("Model ID must not be empty");
   });
 });
 

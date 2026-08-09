@@ -28,8 +28,8 @@ interface SessionDocument {
 }
 
 export interface LoadedSession {
-  id: string;
   messages: Anthropic.MessageParam[];
+  model: string;
   updatedAt: string;
 }
 
@@ -47,6 +47,12 @@ export class SessionStore {
   #id: string = randomUUID();
 
   constructor(options: SessionStoreOptions) {
+    if (!isNonEmptyString(options.workspace)) {
+      throw new Error("Session workspace must not be empty.");
+    }
+    if (!isNonEmptyString(options.model)) {
+      throw new Error("Session model must not be empty.");
+    }
     const base = options.baseDirectory ?? defaultStateDirectory();
     const workspaceKey = createHash("sha256")
       .update(options.workspace)
@@ -100,8 +106,8 @@ export class SessionStore {
     this.#id = document.id;
     this.#createdAt = document.createdAt;
     return {
-      id: document.id,
       messages: structuredClone(document.messages),
+      model: document.model,
       updatedAt: document.updatedAt,
     };
   }
@@ -151,33 +157,198 @@ export function defaultStateDirectory(): string {
   return path.join(os.homedir(), ".hellocode");
 }
 
+/**
+ * Removes model-bound reasoning signatures before history is sent to a
+ * different model. The input is cloned and never mutated.
+ */
+export function stripThinkingBlocks(
+  messages: readonly Anthropic.MessageParam[],
+): Anthropic.MessageParam[] {
+  return structuredClone(messages).map((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      return message;
+    }
+
+    const content = message.content.filter(
+      (block) =>
+        block.type !== "thinking" && block.type !== "redacted_thinking",
+    );
+    return {
+      ...message,
+      content:
+        content.length > 0
+          ? content
+          : [
+              {
+                type: "text",
+                text: "[Prior model reasoning omitted after switching models.]",
+              },
+            ],
+    };
+  }) as Anthropic.MessageParam[];
+}
+
 function validateSession(value: unknown, filePath: string): SessionDocument {
   if (!isRecord(value)) throw invalidSession(filePath);
   if (
     value.version !== SESSION_VERSION ||
-    typeof value.id !== "string" ||
-    typeof value.workspace !== "string" ||
-    typeof value.model !== "string" ||
-    typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string" ||
+    !isUuid(value.id) ||
+    !isNonEmptyString(value.workspace) ||
+    !isNonEmptyString(value.model) ||
+    !isIsoTimestamp(value.createdAt) ||
+    !isIsoTimestamp(value.updatedAt) ||
+    Date.parse(value.createdAt) > Date.parse(value.updatedAt) ||
     !Array.isArray(value.messages) ||
-    !value.messages.every(isMessage)
+    !isValidConversation(value.messages)
   ) {
     throw invalidSession(filePath);
   }
   return value as unknown as SessionDocument;
 }
 
-function isMessage(value: unknown): boolean {
-  if (!isRecord(value)) return false;
-  if (value.role !== "user" && value.role !== "assistant") return false;
-  if (typeof value.content === "string") return true;
+function isValidConversation(messages: unknown[]): boolean {
+  if (messages.length > 0) {
+    const first = messages[0];
+    if (!isRecord(first) || first.role !== "user") return false;
+  }
+  let expectedToolIds: Set<string> | undefined;
+
+  for (const value of messages) {
+    if (!isRecord(value)) return false;
+
+    if (expectedToolIds !== undefined) {
+      if (value.role !== "user" || !Array.isArray(value.content)) return false;
+      const resultIds = toolResultIds(value.content);
+      if (resultIds === undefined || !sameIds(resultIds, expectedToolIds)) {
+        return false;
+      }
+      expectedToolIds = undefined;
+      continue;
+    }
+
+    if (value.role === "user") {
+      if (!isNaturalUserContent(value.content)) return false;
+      continue;
+    }
+    if (value.role !== "assistant" || !isAssistantContent(value.content)) {
+      return false;
+    }
+
+    if (Array.isArray(value.content)) {
+      const toolIds = value.content
+        .filter(isToolUseBlock)
+        .map((block) => block.id);
+      if (new Set(toolIds).size !== toolIds.length) return false;
+      if (toolIds.length > 0) expectedToolIds = new Set(toolIds);
+    }
+  }
+
+  return expectedToolIds === undefined;
+}
+
+function isNaturalUserContent(value: unknown): boolean {
+  if (typeof value === "string") return true;
   return (
-    Array.isArray(value.content) &&
-    value.content.every(
-      (block) => isRecord(block) && typeof block.type === "string",
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((block) => isTextBlock(block))
+  );
+}
+
+function isAssistantContent(value: unknown): boolean {
+  if (typeof value === "string") return true;
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (block) =>
+        isTextBlock(block) ||
+        isThinkingBlock(block) ||
+        isRedactedThinkingBlock(block) ||
+        isToolUseBlock(block),
     )
   );
+}
+
+function isTextBlock(value: unknown): value is Anthropic.TextBlockParam {
+  return (
+    isRecord(value) && value.type === "text" && typeof value.text === "string"
+  );
+}
+
+function isThinkingBlock(
+  value: unknown,
+): value is Anthropic.ThinkingBlockParam {
+  return (
+    isRecord(value) &&
+    value.type === "thinking" &&
+    typeof value.thinking === "string" &&
+    isNonEmptyString(value.signature)
+  );
+}
+
+function isRedactedThinkingBlock(
+  value: unknown,
+): value is Anthropic.RedactedThinkingBlockParam {
+  return (
+    isRecord(value) &&
+    value.type === "redacted_thinking" &&
+    isNonEmptyString(value.data)
+  );
+}
+
+function isToolUseBlock(value: unknown): value is Anthropic.ToolUseBlockParam {
+  return (
+    isRecord(value) &&
+    value.type === "tool_use" &&
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.name) &&
+    isRecord(value.input)
+  );
+}
+
+function toolResultIds(blocks: unknown[]): Set<string> | undefined {
+  if (blocks.length === 0) return undefined;
+  const ids = new Set<string>();
+  for (const block of blocks) {
+    if (
+      !isRecord(block) ||
+      block.type !== "tool_result" ||
+      !isNonEmptyString(block.tool_use_id) ||
+      typeof block.content !== "string" ||
+      (block.is_error !== undefined && typeof block.is_error !== "boolean") ||
+      ids.has(block.tool_use_id)
+    ) {
+      return undefined;
+    }
+    ids.add(block.tool_use_id);
+  }
+  return ids;
+}
+
+function sameIds(left: Set<string>, right: Set<string>): boolean {
+  return left.size === right.size && [...left].every((id) => right.has(id));
+}
+
+function isUuid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      value,
+    )
+  );
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return (
+    Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+  );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
