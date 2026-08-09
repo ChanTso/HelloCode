@@ -9,7 +9,6 @@ export interface TokenUsage {
 
 export interface ModelTurn {
   content: Anthropic.ContentBlock[];
-  requestId?: string;
   stopReason: Anthropic.StopReason | null;
   usage: TokenUsage;
 }

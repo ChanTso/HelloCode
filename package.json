@@ -12,7 +12,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -40,7 +41,7 @@
   },
   "homepage": "https://github.com/ChanTso/HelloCode#readme",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0"

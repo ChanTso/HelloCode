@@ -39,7 +39,7 @@ export class AnthropicModel implements ModelClient {
     }
 
     const message = await stream.finalMessage();
-    const turn: ModelTurn = {
+    return {
       content: message.content,
       stopReason: message.stop_reason,
       usage: {
@@ -49,12 +49,6 @@ export class AnthropicModel implements ModelClient {
         output: message.usage.output_tokens,
       },
     };
-
-    if (stream.request_id !== null && stream.request_id !== undefined) {
-      turn.requestId = stream.request_id;
-    }
-
-    return turn;
   }
 }
 

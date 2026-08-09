@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24]
 
     steps:
       - name: Check out repository
@@ -40,5 +40,14 @@ jobs:
       - name: Build package
         run: npm run build
 
-      - name: Inspect package contents
-        run: npm pack --dry-run
+      - name: Smoke-test packed CLI
+        shell: bash
+        run: |
+          pack_dir="$(mktemp -d)"
+          install_dir="$(mktemp -d)"
+          npm pack --pack-destination "$pack_dir"
+          tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          npm install --global --prefix "$install_dir" "$tarball"
+          "$install_dir/bin/hellocode" --version
+          "$install_dir/bin/hellocode" --help > /dev/null

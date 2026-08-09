@@ -1,7 +1,7 @@
 # HelloCode
 
 [![CI](https://github.com/ChanTso/HelloCode/actions/workflows/ci.yml/badge.svg)](https://github.com/ChanTso/HelloCode/actions/workflows/ci.yml)
-[![Node.js 20.19+](https://img.shields.io/badge/node-%3E%3D20.19-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js 22+](https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A small, practical coding agent for the terminal, built in TypeScript around one model–tool loop.
@@ -21,7 +21,7 @@ HelloCode · claude-sonnet-5 · default
 → edit_file src/routes/users.ts
 ✓ edit_file
 → run_command npm test -- users
-? Allow shell: npm test -- users? [y/N] y
+? Allow shell: "npm test -- users"? [y/N] y
 ✓ run_command
 
 Added request validation and covered the invalid-input path. The focused test suite passes.
@@ -29,7 +29,7 @@ Added request validation and covered the invalid-input path. The focused test su
 
 ## Quick start
 
-Requires Node.js 20.19 or newer and an [Anthropic API key](https://console.anthropic.com/settings/keys).
+Requires Node.js 22 or newer and an [Anthropic API key](https://console.anthropic.com/settings/keys).
 
 ```sh
 npm install --global github:ChanTso/HelloCode
@@ -59,14 +59,14 @@ npm link
 
 ### Tools
 
-| Tool          | Purpose                                                                       |
-| ------------- | ----------------------------------------------------------------------------- |
-| `read_file`   | Read UTF-8 files with line numbers and pagination                             |
-| `list_files`  | List files with lightweight glob matching                                     |
-| `search_text` | Literal or regex search; uses `rg` when available and has a built-in fallback |
-| `edit_file`   | Make an exact, uniqueness-checked replacement                                 |
-| `write_file`  | Create a file or explicitly replace one, using an atomic write                |
-| `run_command` | Run a shell command in the workspace with a timeout and bounded output        |
+| Tool          | Purpose                                                                |
+| ------------- | ---------------------------------------------------------------------- |
+| `read_file`   | Read UTF-8 files with line numbers and pagination                      |
+| `list_files`  | List files with lightweight glob matching                              |
+| `search_text` | Literal search with a built-in fallback; regex search uses `rg`        |
+| `edit_file`   | Make an exact, uniqueness-checked replacement                          |
+| `write_file`  | Create a file or explicitly replace one, using an atomic write         |
+| `run_command` | Run a shell command in the workspace with a timeout and bounded output |
 
 ## Usage
 
