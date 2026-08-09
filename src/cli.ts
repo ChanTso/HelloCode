@@ -203,7 +203,7 @@ async function resolveConfig(
 
 async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
   const paths = await WorkspacePaths.create(config.workspace);
-  const session = config.save || config.continueSession
+  const sessionStore = config.save || config.continueSession
     ? new SessionStore({ workspace: paths.root, model: config.model })
     : undefined;
   const permission = new PermissionGate(
@@ -219,25 +219,26 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
     onEvent: (event) => ui.render(event),
   });
 
-  if (config.continueSession && session !== undefined) {
-    const loaded = await session.loadLatest();
+  if (config.continueSession && sessionStore !== undefined) {
+    const loaded = await sessionStore.loadLatest();
     if (loaded === undefined) ui.notice('No previous session found for this workspace.');
     else {
       agent.restore(loaded.messages);
       ui.notice(`Resumed session from ${new Date(loaded.updatedAt).toLocaleString()}.`);
     }
   }
+  const writableSession = config.save ? sessionStore : undefined;
 
   if (!config.interactive) {
     const result = await runTurn(agent, config.prompt ?? '', ui);
-    await saveSession(session, agent, ui);
+    await saveSession(writableSession, agent, ui);
     if (result === undefined) return 130;
     reportStop(result, ui);
     return result.stop === 'complete' ? 0 : 1;
   }
 
   ui.showHeader(paths.root, config.model, config.mode);
-  return interactiveLoop(agent, session, ui);
+  return interactiveLoop(agent, writableSession, ui);
 }
 
 async function interactiveLoop(

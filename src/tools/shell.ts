@@ -111,11 +111,13 @@ async function runCommand(
       : result.signal !== null
         ? `Terminated by ${result.signal}`
         : `Exit code: ${result.code ?? 'unknown'}`;
-    return [
+    const output = [
       status,
       `stdout:\n${stdout.toString() || '(empty)'}`,
       `stderr:\n${stderr.toString() || '(empty)'}`,
     ].join('\n\n');
+    if (timedOut) throw new Error(output);
+    return output;
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener('abort', onAbort);

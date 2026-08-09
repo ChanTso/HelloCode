@@ -105,6 +105,7 @@ export class Agent {
     const usage = emptyUsage();
     const textParts: string[] = [];
     let toolCalls = 0;
+    let reactiveCompactionUsed = false;
 
     for (let turns = 1; turns <= this.#maxTurns; turns += 1) {
       if (isAborted(signal)) throw abortError();
@@ -191,10 +192,20 @@ export class Agent {
         case 'stop_sequence':
           return { stop: 'complete', text: textParts.join('\n'), toolCalls, turns, usage };
         case 'pause_turn':
+          if (turns === this.#maxTurns) {
+            return { stop: 'turn_limit', text: textParts.join('\n'), toolCalls, turns, usage };
+          }
           continue;
         case 'max_tokens':
           return { stop: 'max_tokens', text: textParts.join('\n'), toolCalls, turns, usage };
         case 'model_context_window_exceeded':
+          if (!reactiveCompactionUsed && turns < this.#maxTurns) {
+            const compacted = this.compact(true);
+            if (compacted.changed) {
+              reactiveCompactionUsed = true;
+              continue;
+            }
+          }
           return { stop: 'context_limit', text: textParts.join('\n'), toolCalls, turns, usage };
         case 'refusal':
           return { stop: 'refusal', text: textParts.join('\n'), toolCalls, turns, usage };

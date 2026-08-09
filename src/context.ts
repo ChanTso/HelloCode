@@ -69,7 +69,7 @@ function shortenOldToolResults(
 ): number {
   const lastProtectedIndex = includeRecent
     ? messages.length
-    : Math.max(0, messages.length - (force ? 2 : 6));
+    : Math.max(0, messages.length - (force ? 1 : 6));
   let count = 0;
 
   for (const [messageIndex, message] of messages.entries()) {
