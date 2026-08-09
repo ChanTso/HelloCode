@@ -1,0 +1,47 @@
+{
+  "name": "hellocode-agent",
+  "version": "0.1.0",
+  "description": "A small, practical coding agent for your terminal.",
+  "type": "module",
+  "bin": {
+    "hellocode": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "lint": "eslint src test --no-error-on-unmatched-pattern --max-warnings=0",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "coding-agent",
+    "claude",
+    "cli",
+    "typescript"
+  ],
+  "author": "ChanTso",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.18.0",
+    "eslint": "^10.8.1",
+    "tsx": "^4.23.11",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^4.1.10"
+  }
+}
