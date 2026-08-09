@@ -1,10 +1,10 @@
-import { lstat, realpath, stat } from 'node:fs/promises';
-import path from 'node:path';
+import { lstat, realpath, stat } from "node:fs/promises";
+import path from "node:path";
 
 export class WorkspaceBoundaryError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'WorkspaceBoundaryError';
+    this.name = "WorkspaceBoundaryError";
   }
 }
 
@@ -72,12 +72,12 @@ export class WorkspacePaths {
 
   display(absolutePath: string): string {
     const relative = path.relative(this.root, absolutePath);
-    return relative === '' ? '.' : relative;
+    return relative === "" ? "." : relative;
   }
 
   #resolveLexically(inputPath: string): string {
-    if (inputPath.trim() === '') {
-      throw new WorkspaceBoundaryError('Path must not be empty.');
+    if (inputPath.trim() === "") {
+      throw new WorkspaceBoundaryError("Path must not be empty.");
     }
     const candidate = path.resolve(this.root, inputPath);
     this.#assertInside(candidate, inputPath);
@@ -87,7 +87,7 @@ export class WorkspacePaths {
   #assertInside(candidate: string, original: string): void {
     const relative = path.relative(this.root, candidate);
     if (
-      relative === '..' ||
+      relative === ".." ||
       relative.startsWith(`..${path.sep}`) ||
       path.isAbsolute(relative)
     ) {
@@ -99,26 +99,26 @@ export class WorkspacePaths {
 }
 
 export function isSensitivePath(filePath: string): boolean {
-  const normalized = filePath.replaceAll('\\', '/').toLowerCase();
+  const normalized = filePath.replaceAll("\\", "/").toLowerCase();
   const basename = path.posix.basename(normalized);
   return (
-    basename === '.env' ||
-    basename.startsWith('.env.') ||
-    basename === '.npmrc' ||
-    basename === '.pypirc' ||
-    basename === 'credentials' ||
-    basename.includes('credential') ||
-    basename.endsWith('.pem') ||
-    basename.endsWith('.key') ||
-    normalized.includes('/.ssh/') ||
-    normalized.endsWith('/.git/config')
+    basename === ".env" ||
+    basename.startsWith(".env.") ||
+    basename === ".npmrc" ||
+    basename === ".pypirc" ||
+    basename === "credentials" ||
+    basename.includes("credential") ||
+    basename.endsWith(".pem") ||
+    basename.endsWith(".key") ||
+    normalized.includes("/.ssh/") ||
+    normalized.endsWith("/.git/config")
   );
 }
 
 function isMissingPathError(error: unknown): boolean {
   return (
     error instanceof Error &&
-    'code' in error &&
-    (error as NodeJS.ErrnoException).code === 'ENOENT'
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
   );
 }

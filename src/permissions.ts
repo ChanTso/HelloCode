@@ -1,5 +1,5 @@
-export type PermissionMode = 'default' | 'plan' | 'bypass';
-export type PermissionKind = 'read' | 'write' | 'shell';
+export type PermissionMode = "default" | "plan" | "bypass";
+export type PermissionKind = "read" | "write" | "shell";
 
 export interface PermissionRequest {
   detail: string;
@@ -13,7 +13,7 @@ export type ApprovalPrompt = (request: PermissionRequest) => Promise<boolean>;
 export class PermissionDeniedError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'PermissionDeniedError';
+    this.name = "PermissionDeniedError";
   }
 }
 
@@ -27,16 +27,16 @@ export class PermissionGate {
   }
 
   async authorize(request: PermissionRequest): Promise<void> {
-    if (this.#mode === 'bypass') return;
+    if (this.#mode === "bypass") return;
 
-    if (this.#mode === 'plan' && request.kind !== 'read') {
+    if (this.#mode === "plan" && request.kind !== "read") {
       throw new PermissionDeniedError(
         `${request.tool} is disabled in plan mode.`,
       );
     }
 
     const needsApproval =
-      request.kind === 'shell' || request.sensitive === true;
+      request.kind === "shell" || request.sensitive === true;
     if (!needsApproval) return;
 
     if (this.#ask === undefined || !(await this.#ask(request))) {

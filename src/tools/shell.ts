@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from "node:child_process";
 
 import {
   defineTool,
@@ -6,7 +6,7 @@ import {
   optionalIntegerField,
   stringField,
   type ToolSpec,
-} from './types.js';
+} from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_CAPTURE_CHARS = 16_000;
@@ -19,32 +19,40 @@ interface CommandInput {
 export function createShellTool(): ToolSpec {
   return defineTool<CommandInput>({
     definition: {
-      name: 'run_command',
+      name: "run_command",
       description:
-        'Run one shell command in the workspace. Returns exit code, stdout, and stderr. Use for builds, tests, git, and other project commands. Commands are not OS-sandboxed and normally require user approval.',
+        "Run one shell command in the workspace. Returns exit code, stdout, and stderr. Use for builds, tests, git, and other project commands. Commands are not OS-sandboxed and normally require user approval.",
       strict: true,
       input_schema: {
-        type: 'object',
+        type: "object",
         properties: {
-          command: { type: 'string', description: 'Command interpreted by the platform shell.' },
-          timeout_ms: { type: 'integer', minimum: 1000, maximum: 600000, description: 'Timeout in milliseconds. Defaults to 120000.' },
+          command: {
+            type: "string",
+            description: "Command interpreted by the platform shell.",
+          },
+          timeout_ms: {
+            type: "integer",
+            minimum: 1000,
+            maximum: 600000,
+            description: "Timeout in milliseconds. Defaults to 120000.",
+          },
         },
-        required: ['command'],
+        required: ["command"],
         additionalProperties: false,
       },
     },
     parse(input) {
-      const value = objectInput(input, ['command', 'timeout_ms']);
+      const value = objectInput(input, ["command", "timeout_ms"]);
       return {
-        command: stringField(value, 'command'),
+        command: stringField(value, "command"),
         timeoutMs:
-          optionalIntegerField(value, 'timeout_ms', 1000, 600_000) ??
+          optionalIntegerField(value, "timeout_ms", 1000, 600_000) ??
           DEFAULT_TIMEOUT_MS,
       };
     },
     permission: (input) => ({
-      tool: 'run_command',
-      kind: 'shell',
+      tool: "run_command",
+      kind: "shell",
       detail:
         input.command.length > 240
           ? `${input.command.slice(0, 237)}...`
@@ -68,22 +76,22 @@ async function runCommand(
 ): Promise<string> {
   if (isAborted(signal)) throw abortError();
 
-  const windows = process.platform === 'win32';
-  const shell = windows ? process.env.ComSpec ?? 'cmd.exe' : '/bin/sh';
-  const args = windows ? ['/d', '/s', '/c', command] : ['-lc', command];
+  const windows = process.platform === "win32";
+  const shell = windows ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh";
+  const args = windows ? ["/d", "/s", "/c", command] : ["-lc", command];
   const child = spawn(shell, args, {
     cwd: workspace,
     detached: !windows,
     env: commandEnvironment(),
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
   const stdout = new BoundedText(MAX_CAPTURE_CHARS);
   const stderr = new BoundedText(MAX_CAPTURE_CHARS);
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (chunk: string) => stdout.append(chunk));
-  child.stderr.on('data', (chunk: string) => stderr.append(chunk));
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => stdout.append(chunk));
+  child.stderr.on("data", (chunk: string) => stderr.append(chunk));
 
   let timedOut = false;
   const timeout = setTimeout(() => {
@@ -93,42 +101,43 @@ async function runCommand(
   timeout.unref();
 
   const onAbort = (): void => terminate(child);
-  signal?.addEventListener('abort', onAbort, { once: true });
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-      (resolve, reject) => {
-        child.once('error', reject);
-        child.once('close', (code, closeSignal) =>
-          resolve({ code, signal: closeSignal }),
-        );
-      },
-    );
+    const result = await new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, closeSignal) =>
+        resolve({ code, signal: closeSignal }),
+      );
+    });
     if (isAborted(signal)) throw abortError();
 
     const status = timedOut
       ? `Timed out after ${timeoutMs} ms`
       : result.signal !== null
         ? `Terminated by ${result.signal}`
-        : `Exit code: ${result.code ?? 'unknown'}`;
+        : `Exit code: ${result.code ?? "unknown"}`;
     const output = [
       status,
-      `stdout:\n${stdout.toString() || '(empty)'}`,
-      `stderr:\n${stderr.toString() || '(empty)'}`,
-    ].join('\n\n');
+      `stdout:\n${stdout.toString() || "(empty)"}`,
+      `stderr:\n${stderr.toString() || "(empty)"}`,
+    ].join("\n\n");
     if (timedOut) throw new Error(output);
     return output;
   } finally {
     clearTimeout(timeout);
-    signal?.removeEventListener('abort', onAbort);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
 class BoundedText {
   readonly #half: number;
-  #head = '';
+  #head = "";
   #omitted = 0;
-  #tail = '';
+  #tail = "";
 
   constructor(limit: number) {
     this.#half = Math.floor(limit / 2);
@@ -165,19 +174,19 @@ class BoundedText {
 function terminate(child: ChildProcess): void {
   if (child.pid === undefined || child.exitCode !== null) return;
   try {
-    if (process.platform === 'win32') child.kill('SIGTERM');
-    else process.kill(-child.pid, 'SIGTERM');
+    if (process.platform === "win32") child.kill("SIGTERM");
+    else process.kill(-child.pid, "SIGTERM");
   } catch {
-    child.kill('SIGTERM');
+    child.kill("SIGTERM");
   }
 
   const force = setTimeout(() => {
     if (child.exitCode !== null || child.pid === undefined) return;
     try {
-      if (process.platform === 'win32') child.kill('SIGKILL');
-      else process.kill(-child.pid, 'SIGKILL');
+      if (process.platform === "win32") child.kill("SIGKILL");
+      else process.kill(-child.pid, "SIGKILL");
     } catch {
-      child.kill('SIGKILL');
+      child.kill("SIGKILL");
     }
   }, 1500);
   force.unref();
@@ -190,18 +199,20 @@ function commandEnvironment(): NodeJS.ProcessEnv {
 }
 
 function sanitizeTerminalText(text: string): string {
-  return text
-    // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, '')
-    // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, '')
-    // eslint-disable-next-line no-control-regex -- terminal control characters are the subject of this sanitizer.
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, '');
+  return (
+    text
+      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
+      .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, "")
+      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
+      .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
+      // eslint-disable-next-line no-control-regex -- terminal control characters are the subject of this sanitizer.
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
+  );
 }
 
 function abortError(): Error {
-  const error = new Error('Command cancelled.');
-  error.name = 'AbortError';
+  const error = new Error("Command cancelled.");
+  error.name = "AbortError";
   return error;
 }
 

@@ -1,34 +1,30 @@
-import type Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from "@anthropic-ai/sdk";
 
-import { ContextManager, type CompactResult } from './context.js';
+import { ContextManager, type CompactResult } from "./context.js";
 import {
   addUsage,
   emptyUsage,
   type ModelClient,
   type TokenUsage,
-} from './model.js';
-import type { ToolExecutionResult, ToolRegistry } from './tools/index.js';
+} from "./model.js";
+import type { ToolExecutionResult, ToolRegistry } from "./tools/index.js";
 
 export type AgentStop =
-  | 'complete'
-  | 'context_limit'
-  | 'max_tokens'
-  | 'refusal'
-  | 'turn_limit';
+  "complete" | "context_limit" | "max_tokens" | "refusal" | "turn_limit";
 
 export type AgentEvent =
-  | { type: 'text'; delta: string }
-  | { type: 'tool_start'; id: string; input: unknown; name: string }
+  | { type: "text"; delta: string }
+  | { type: "tool_start"; id: string; input: unknown; name: string }
   | {
-      type: 'tool_result';
+      type: "tool_result";
       id: string;
       isError: boolean;
       name: string;
       preview: string;
     }
-  | { type: 'usage'; usage: TokenUsage }
+  | { type: "usage"; usage: TokenUsage }
   | {
-      type: 'context_compacted';
+      type: "context_compacted";
       removedTurns: number;
       shortenedResults: number;
     };
@@ -90,7 +86,7 @@ export class Agent {
     if (result.changed) {
       this.#messages = result.messages;
       this.#onEvent?.({
-        type: 'context_compacted',
+        type: "context_compacted",
         removedTurns: result.removedTurns,
         shortenedResults: result.shortenedResults,
       });
@@ -98,9 +94,13 @@ export class Agent {
     return result;
   }
 
-  async run(userMessage: string, signal?: AbortSignal): Promise<AgentRunResult> {
-    if (userMessage.trim() === '') throw new Error('Message must not be empty.');
-    this.#messages.push({ role: 'user', content: userMessage });
+  async run(
+    userMessage: string,
+    signal?: AbortSignal,
+  ): Promise<AgentRunResult> {
+    if (userMessage.trim() === "")
+      throw new Error("Message must not be empty.");
+    this.#messages.push({ role: "user", content: userMessage });
 
     const usage = emptyUsage();
     const textParts: string[] = [];
@@ -115,37 +115,40 @@ export class Agent {
         system: this.#system,
         tools: this.#registry.definitions(),
         ...(signal === undefined ? {} : { signal }),
-        onText: (delta) => this.#onEvent?.({ type: 'text', delta }),
+        onText: (delta) => this.#onEvent?.({ type: "text", delta }),
       });
       addUsage(usage, turn.usage);
-      this.#onEvent?.({ type: 'usage', usage: { ...usage } });
+      this.#onEvent?.({ type: "usage", usage: { ...usage } });
       this.#messages.push({
-        role: 'assistant',
+        role: "assistant",
         content: turn.content as Anthropic.ContentBlockParam[],
       });
 
       const turnText = turn.content
-        .filter((block): block is Anthropic.TextBlock => block.type === 'text')
+        .filter((block): block is Anthropic.TextBlock => block.type === "text")
         .map((block) => block.text)
-        .join('');
+        .join("");
       if (turnText.length > 0) textParts.push(turnText);
 
       const calls = turn.content.filter(
-        (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use',
+        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
       );
 
-      if (turn.stopReason === 'tool_use') {
+      if (turn.stopReason === "tool_use") {
         if (calls.length === 0) {
-          throw new Error('Model stopped for tool use without a tool call.');
+          throw new Error("Model stopped for tool use without a tool call.");
         }
         if (
           turns === this.#maxTurns ||
           toolCalls + calls.length > this.#maxToolCalls
         ) {
-          this.#appendSkippedResults(calls, 'HelloCode reached its tool or turn limit.');
+          this.#appendSkippedResults(
+            calls,
+            "HelloCode reached its tool or turn limit.",
+          );
           return {
-            stop: 'turn_limit',
-            text: textParts.join('\n'),
+            stop: "turn_limit",
+            text: textParts.join("\n"),
             toolCalls,
             turns,
             usage,
@@ -157,7 +160,7 @@ export class Agent {
           if (isAborted(signal)) throw abortError();
           toolCalls += 1;
           this.#onEvent?.({
-            type: 'tool_start',
+            type: "tool_start",
             id: call.id,
             input: call.input,
             name: call.name,
@@ -169,14 +172,14 @@ export class Agent {
           );
           results.push(toToolResult(call.id, result));
           this.#onEvent?.({
-            type: 'tool_result',
+            type: "tool_result",
             id: call.id,
             isError: result.isError,
             name: call.name,
             preview: result.content.slice(0, 160),
           });
         }
-        this.#messages.push({ role: 'user', content: results });
+        this.#messages.push({ role: "user", content: results });
         continue;
       }
 
@@ -188,17 +191,35 @@ export class Agent {
       }
 
       switch (turn.stopReason) {
-        case 'end_turn':
-        case 'stop_sequence':
-          return { stop: 'complete', text: textParts.join('\n'), toolCalls, turns, usage };
-        case 'pause_turn':
+        case "end_turn":
+        case "stop_sequence":
+          return {
+            stop: "complete",
+            text: textParts.join("\n"),
+            toolCalls,
+            turns,
+            usage,
+          };
+        case "pause_turn":
           if (turns === this.#maxTurns) {
-            return { stop: 'turn_limit', text: textParts.join('\n'), toolCalls, turns, usage };
+            return {
+              stop: "turn_limit",
+              text: textParts.join("\n"),
+              toolCalls,
+              turns,
+              usage,
+            };
           }
           continue;
-        case 'max_tokens':
-          return { stop: 'max_tokens', text: textParts.join('\n'), toolCalls, turns, usage };
-        case 'model_context_window_exceeded':
+        case "max_tokens":
+          return {
+            stop: "max_tokens",
+            text: textParts.join("\n"),
+            toolCalls,
+            turns,
+            usage,
+          };
+        case "model_context_window_exceeded":
           if (!reactiveCompactionUsed && turns < this.#maxTurns) {
             const compacted = this.compact(true);
             if (compacted.changed) {
@@ -206,27 +227,38 @@ export class Agent {
               continue;
             }
           }
-          return { stop: 'context_limit', text: textParts.join('\n'), toolCalls, turns, usage };
-        case 'refusal':
-          return { stop: 'refusal', text: textParts.join('\n'), toolCalls, turns, usage };
+          return {
+            stop: "context_limit",
+            text: textParts.join("\n"),
+            toolCalls,
+            turns,
+            usage,
+          };
+        case "refusal":
+          return {
+            stop: "refusal",
+            text: textParts.join("\n"),
+            toolCalls,
+            turns,
+            usage,
+          };
         case null:
-          throw new Error('Model returned a final message without a stop reason.');
+          throw new Error(
+            "Model returned a final message without a stop reason.",
+          );
         default:
           return assertNever(turn.stopReason);
       }
     }
 
-    throw new Error('Agent loop ended unexpectedly.');
+    throw new Error("Agent loop ended unexpectedly.");
   }
 
-  #appendSkippedResults(
-    calls: Anthropic.ToolUseBlock[],
-    reason: string,
-  ): void {
+  #appendSkippedResults(calls: Anthropic.ToolUseBlock[], reason: string): void {
     this.#messages.push({
-      role: 'user',
+      role: "user",
       content: calls.map((call) => ({
-        type: 'tool_result',
+        type: "tool_result",
         tool_use_id: call.id,
         content: reason,
         is_error: true,
@@ -240,7 +272,7 @@ function toToolResult(
   result: ToolExecutionResult,
 ): Anthropic.ToolResultBlockParam {
   return {
-    type: 'tool_result',
+    type: "tool_result",
     tool_use_id: id,
     content: result.content,
     ...(result.isError ? { is_error: true } : {}),
@@ -252,8 +284,8 @@ function assertNever(value: never): never {
 }
 
 function abortError(): Error {
-  const error = new Error('Agent run cancelled.');
-  error.name = 'AbortError';
+  const error = new Error("Agent run cancelled.");
+  error.name = "AbortError";
   return error;
 }
 

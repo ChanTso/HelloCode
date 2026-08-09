@@ -1,4 +1,4 @@
-import type Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from "@anthropic-ai/sdk";
 
 const DEFAULT_MAX_CHARS = 600_000;
 const COMPACTED_RESULT_CHARS = 1200;
@@ -15,7 +15,7 @@ export class ContextManager {
 
   constructor(maxChars = DEFAULT_MAX_CHARS) {
     if (!Number.isInteger(maxChars) || maxChars < 20_000) {
-      throw new Error('Context character budget must be at least 20000.');
+      throw new Error("Context character budget must be at least 20000.");
     }
     this.#maxChars = maxChars;
   }
@@ -37,7 +37,9 @@ export class ContextManager {
     const messages = structuredClone(source) as Anthropic.MessageParam[];
     let shortenedResults = shortenOldToolResults(messages, force);
     let removedTurns = 0;
-    const target = force ? Math.floor(this.#maxChars * 0.5) : Math.floor(this.#maxChars * 0.8);
+    const target = force
+      ? Math.floor(this.#maxChars * 0.5)
+      : Math.floor(this.#maxChars * 0.8);
 
     const starts = naturalTurnStarts(messages);
     if (starts.length > 1 && (force || estimateSize(messages) > target)) {
@@ -45,7 +47,10 @@ export class ContextManager {
       if (keepFrom !== undefined && keepFrom > 0) {
         const removed = messages.splice(0, keepFrom);
         removedTurns = countNaturalTurns(removed);
-        prependCompactionNote(messages, summarizeRemoved(removed, removedTurns));
+        prependCompactionNote(
+          messages,
+          summarizeRemoved(removed, removedTurns),
+        );
       }
     }
 
@@ -77,8 +82,8 @@ function shortenOldToolResults(
     if (!Array.isArray(message.content)) continue;
     for (const block of message.content) {
       if (
-        block.type !== 'tool_result' ||
-        typeof block.content !== 'string' ||
+        block.type !== "tool_result" ||
+        typeof block.content !== "string" ||
         block.content.length <= COMPACTED_RESULT_CHARS
       ) {
         continue;
@@ -91,10 +96,13 @@ function shortenOldToolResults(
   return count;
 }
 
-function naturalTurnStarts(messages: readonly Anthropic.MessageParam[]): number[] {
+function naturalTurnStarts(
+  messages: readonly Anthropic.MessageParam[],
+): number[] {
   const starts: number[] = [];
   for (const [index, message] of messages.entries()) {
-    if (message.role === 'user' && !isToolResultOnly(message)) starts.push(index);
+    if (message.role === "user" && !isToolResultOnly(message))
+      starts.push(index);
   }
   return starts;
 }
@@ -103,11 +111,13 @@ function isToolResultOnly(message: Anthropic.MessageParam): boolean {
   return (
     Array.isArray(message.content) &&
     message.content.length > 0 &&
-    message.content.every((block) => block.type === 'tool_result')
+    message.content.every((block) => block.type === "tool_result")
   );
 }
 
-function countNaturalTurns(messages: readonly Anthropic.MessageParam[]): number {
+function countNaturalTurns(
+  messages: readonly Anthropic.MessageParam[],
+): number {
   return naturalTurnStarts(messages).length;
 }
 
@@ -117,14 +127,14 @@ function summarizeRemoved(
 ): string {
   const excerpts: string[] = [];
   for (const message of messages) {
-    const text = messageText(message).trim().replace(/\s+/gu, ' ');
+    const text = messageText(message).trim().replace(/\s+/gu, " ");
     if (text.length === 0) continue;
-    const role = message.role === 'user' ? 'User' : 'Assistant';
+    const role = message.role === "user" ? "User" : "Assistant";
     excerpts.push(`- ${role}: ${text.slice(0, 500)}`);
     if (excerpts.length === 8) break;
   }
-  const detail = excerpts.length === 0 ? '' : `\n${excerpts.join('\n')}`;
-  return `[HelloCode compacted ${turns} earlier conversation turn${turns === 1 ? '' : 's'}. Re-inspect the workspace before relying on omitted details.]${detail}`;
+  const detail = excerpts.length === 0 ? "" : `\n${excerpts.join("\n")}`;
+  return `[HelloCode compacted ${turns} earlier conversation turn${turns === 1 ? "" : "s"}. Re-inspect the workspace before relying on omitted details.]${detail}`;
 }
 
 function prependCompactionNote(
@@ -132,19 +142,19 @@ function prependCompactionNote(
   note: string,
 ): void {
   const first = messages[0];
-  if (first?.role === 'user' && typeof first.content === 'string') {
+  if (first?.role === "user" && typeof first.content === "string") {
     first.content = `${note}\n\n${first.content}`;
     return;
   }
-  messages.unshift({ role: 'user', content: note });
+  messages.unshift({ role: "user", content: note });
 }
 
 function messageText(message: Anthropic.MessageParam): string {
-  if (typeof message.content === 'string') return message.content;
+  if (typeof message.content === "string") return message.content;
   return message.content
-    .filter((block): block is Anthropic.TextBlockParam => block.type === 'text')
+    .filter((block): block is Anthropic.TextBlockParam => block.type === "text")
     .map((block) => block.text)
-    .join('\n');
+    .join("\n");
 }
 
 function estimateSize(messages: readonly Anthropic.MessageParam[]): number {

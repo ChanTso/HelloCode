@@ -1,12 +1,8 @@
-import type Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from "@anthropic-ai/sdk";
 
-import type { PermissionGate } from '../permissions.js';
-import type { WorkspacePaths } from '../paths.js';
-import {
-  errorMessage,
-  truncateToolResult,
-  type ToolSpec,
-} from './types.js';
+import type { PermissionGate } from "../permissions.js";
+import type { WorkspacePaths } from "../paths.js";
+import { errorMessage, truncateToolResult, type ToolSpec } from "./types.js";
 
 export interface ToolExecutionResult {
   content: string;
@@ -56,7 +52,9 @@ export class ToolRegistry {
         ...(signal === undefined ? {} : { signal }),
       });
       return {
-        content: truncateToolResult(output.length === 0 ? '(no output)' : output),
+        content: truncateToolResult(
+          output.length === 0 ? "(no output)" : output,
+        ),
         isError: false,
       };
     } catch (error) {

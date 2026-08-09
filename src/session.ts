@@ -1,9 +1,18 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
-import type Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from "@anthropic-ai/sdk";
 
 const SESSION_VERSION = 1;
 const MAX_SESSION_BYTES = 20 * 1024 * 1024;
@@ -39,11 +48,11 @@ export class SessionStore {
 
   constructor(options: SessionStoreOptions) {
     const base = options.baseDirectory ?? defaultStateDirectory();
-    const workspaceKey = createHash('sha256')
+    const workspaceKey = createHash("sha256")
       .update(options.workspace)
-      .digest('hex')
+      .digest("hex")
       .slice(0, 16);
-    this.#directory = path.join(base, 'sessions', workspaceKey);
+    this.#directory = path.join(base, "sessions", workspaceKey);
     this.#workspace = options.workspace;
     this.#model = options.model;
   }
@@ -51,8 +60,9 @@ export class SessionStore {
   async loadLatest(): Promise<LoadedSession | undefined> {
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     await chmod(this.#directory, 0o700);
-    const names = (await readdir(this.#directory))
-      .filter((name) => name.startsWith('session-') && name.endsWith('.json'));
+    const names = (await readdir(this.#directory)).filter(
+      (name) => name.startsWith("session-") && name.endsWith(".json"),
+    );
     if (names.length === 0) return undefined;
 
     const candidates = await Promise.all(
@@ -67,12 +77,14 @@ export class SessionStore {
     const filePath = path.join(this.#directory, latest.name);
     const fileStat = await stat(filePath);
     if (fileStat.size > MAX_SESSION_BYTES) {
-      throw new Error(`Latest HelloCode session is too large to load: ${filePath}`);
+      throw new Error(
+        `Latest HelloCode session is too large to load: ${filePath}`,
+      );
     }
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await readFile(filePath, 'utf8'));
+      parsed = JSON.parse(await readFile(filePath, "utf8"));
     } catch (error) {
       throw new Error(
         `Could not read latest HelloCode session ${filePath}: ${errorMessage(error)}`,
@@ -81,7 +93,9 @@ export class SessionStore {
     }
     const document = validateSession(parsed, filePath);
     if (document.workspace !== this.#workspace) {
-      throw new Error('Latest HelloCode session belongs to a different workspace.');
+      throw new Error(
+        "Latest HelloCode session belongs to a different workspace.",
+      );
     }
     this.#id = document.id;
     this.#createdAt = document.createdAt;
@@ -109,8 +123,8 @@ export class SessionStore {
 
     try {
       await writeFile(temporary, `${JSON.stringify(document)}\n`, {
-        encoding: 'utf8',
-        flag: 'wx',
+        encoding: "utf8",
+        flag: "wx",
         mode: 0o600,
       });
       await chmod(temporary, 0o600);
@@ -128,23 +142,24 @@ export class SessionStore {
 
 export function defaultStateDirectory(): string {
   const override = process.env.HELLOCODE_HOME;
-  if (override !== undefined && override.length > 0) return path.resolve(override);
+  if (override !== undefined && override.length > 0)
+    return path.resolve(override);
   const xdgState = process.env.XDG_STATE_HOME;
   if (xdgState !== undefined && xdgState.length > 0) {
-    return path.join(xdgState, 'hellocode');
+    return path.join(xdgState, "hellocode");
   }
-  return path.join(os.homedir(), '.hellocode');
+  return path.join(os.homedir(), ".hellocode");
 }
 
 function validateSession(value: unknown, filePath: string): SessionDocument {
   if (!isRecord(value)) throw invalidSession(filePath);
   if (
     value.version !== SESSION_VERSION ||
-    typeof value.id !== 'string' ||
-    typeof value.workspace !== 'string' ||
-    typeof value.model !== 'string' ||
-    typeof value.createdAt !== 'string' ||
-    typeof value.updatedAt !== 'string' ||
+    typeof value.id !== "string" ||
+    typeof value.workspace !== "string" ||
+    typeof value.model !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string" ||
     !Array.isArray(value.messages) ||
     !value.messages.every(isMessage)
   ) {
@@ -155,18 +170,18 @@ function validateSession(value: unknown, filePath: string): SessionDocument {
 
 function isMessage(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  if (value.role !== 'user' && value.role !== 'assistant') return false;
-  if (typeof value.content === 'string') return true;
+  if (value.role !== "user" && value.role !== "assistant") return false;
+  if (typeof value.content === "string") return true;
   return (
     Array.isArray(value.content) &&
     value.content.every(
-      (block) => isRecord(block) && typeof block.type === 'string',
+      (block) => isRecord(block) && typeof block.type === "string",
     )
   );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function invalidSession(filePath: string): Error {

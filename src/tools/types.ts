@@ -1,7 +1,7 @@
-import type Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from "@anthropic-ai/sdk";
 
-import type { PermissionRequest } from '../permissions.js';
-import type { WorkspacePaths } from '../paths.js';
+import type { PermissionRequest } from "../permissions.js";
+import type { WorkspacePaths } from "../paths.js";
 
 export const MAX_TOOL_RESULT_CHARS = 30_000;
 
@@ -37,8 +37,8 @@ export function objectInput(
   input: unknown,
   allowedKeys: readonly string[],
 ): Record<string, unknown> {
-  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-    throw new TypeError('Tool input must be an object.');
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new TypeError("Tool input must be an object.");
   }
   const record = input as Record<string, unknown>;
   const unexpected = Object.keys(record).filter(
@@ -55,7 +55,7 @@ export function stringField(
   name: string,
 ): string {
   const value = input[name];
-  if (typeof value !== 'string' || value.length === 0) {
+  if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${name} must be a non-empty string.`);
   }
   return value;
@@ -67,7 +67,7 @@ export function optionalStringField(
 ): string | undefined {
   const value = input[name];
   if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.length === 0) {
+  if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${name} must be a non-empty string when provided.`);
   }
   return value;
@@ -79,7 +79,7 @@ export function optionalBooleanField(
 ): boolean | undefined {
   const value = input[name];
   if (value === undefined) return undefined;
-  if (typeof value !== 'boolean') {
+  if (typeof value !== "boolean") {
     throw new TypeError(`${name} must be a boolean when provided.`);
   }
   return value;
@@ -94,7 +94,7 @@ export function optionalIntegerField(
   const value = input[name];
   if (value === undefined) return undefined;
   if (
-    typeof value !== 'number' ||
+    typeof value !== "number" ||
     !Number.isInteger(value) ||
     value < minimum ||
     value > maximum

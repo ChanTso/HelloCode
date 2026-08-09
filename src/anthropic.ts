@@ -1,8 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
+import Anthropic from "@anthropic-ai/sdk";
 
-import type { ModelClient, ModelRequest, ModelTurn } from './model.js';
+import type { ModelClient, ModelRequest, ModelTurn } from "./model.js";
 
-export const DEFAULT_MODEL = 'claude-sonnet-5';
+export const DEFAULT_MODEL = "claude-sonnet-5";
 export const DEFAULT_MAX_TOKENS = 16_384;
 
 export interface AnthropicModelOptions {
@@ -35,7 +35,7 @@ export class AnthropicModel implements ModelClient {
     );
 
     if (request.onText !== undefined) {
-      stream.on('text', request.onText);
+      stream.on("text", request.onText);
     }
 
     const message = await stream.finalMessage();
@@ -60,18 +60,18 @@ export class AnthropicModel implements ModelClient {
 
 export function formatProviderError(error: unknown): string {
   if (error instanceof Anthropic.APIUserAbortError) {
-    return 'Request cancelled.';
+    return "Request cancelled.";
   }
 
   if (error instanceof Anthropic.APIError) {
     const details = [
       error.status === undefined ? undefined : `HTTP ${error.status}`,
-      typeof error.type === 'string' ? error.type : undefined,
+      typeof error.type === "string" ? error.type : undefined,
       error.requestID === undefined ? undefined : `request ${error.requestID}`,
     ].filter((value): value is string => value !== undefined);
     return details.length === 0
       ? error.message
-      : `${error.message} (${details.join(', ')})`;
+      : `${error.message} (${details.join(", ")})`;
   }
 
   return error instanceof Error ? error.message : String(error);

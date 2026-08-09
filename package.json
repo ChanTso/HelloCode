@@ -14,12 +14,14 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "lint": "eslint src test --no-error-on-unmatched-pattern --max-warnings=0",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run lint && npm run typecheck && npm test",
-    "prepack": "npm run build"
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
+    "prepare": "npm run build"
   },
   "keywords": [
     "coding-agent",
@@ -29,6 +31,14 @@
   ],
   "author": "ChanTso",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChanTso/HelloCode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ChanTso/HelloCode/issues"
+  },
+  "homepage": "https://github.com/ChanTso/HelloCode#readme",
   "engines": {
     "node": ">=20.19.0"
   },
@@ -39,6 +49,7 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.18.0",
     "eslint": "^10.8.1",
+    "prettier": "^3.9.6",
     "tsx": "^4.23.11",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.66.0",
