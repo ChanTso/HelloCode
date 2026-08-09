@@ -14,21 +14,27 @@ export interface ToolSpec {
   definition: Anthropic.Tool;
   execute(input: unknown, context: ToolContext): Promise<string>;
   parse(input: unknown): unknown;
-  permission(input: unknown): PermissionRequest;
+  permission(
+    input: unknown,
+    context: ToolContext,
+  ): PermissionRequest | Promise<PermissionRequest>;
 }
 
 interface TypedToolSpec<T> {
   definition: Anthropic.Tool;
   execute(input: T, context: ToolContext): Promise<string>;
   parse(input: unknown): T;
-  permission(input: T): PermissionRequest;
+  permission(
+    input: T,
+    context: ToolContext,
+  ): PermissionRequest | Promise<PermissionRequest>;
 }
 
 export function defineTool<T>(spec: TypedToolSpec<T>): ToolSpec {
   return {
     definition: spec.definition,
     parse: spec.parse,
-    permission: (input) => spec.permission(input as T),
+    permission: (input, context) => spec.permission(input as T, context),
     execute: (input, context) => spec.execute(input as T, context),
   };
 }

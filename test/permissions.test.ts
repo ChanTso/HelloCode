@@ -60,4 +60,31 @@ describe("PermissionGate", () => {
       }),
     ).resolves.toBeUndefined();
   });
+
+  it("propagates cancellation while waiting for approval", async () => {
+    const gate = new PermissionGate(
+      "default",
+      async (_request, signal) =>
+        new Promise<boolean>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("cancelled");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true },
+          );
+        }),
+    );
+    const controller = new AbortController();
+    const pending = gate.authorize(
+      { tool: "run_command", kind: "shell", detail: "npm test" },
+      controller.signal,
+    );
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
 });

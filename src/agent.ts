@@ -100,29 +100,38 @@ export class Agent {
   ): Promise<AgentRunResult> {
     if (userMessage.trim() === "")
       throw new Error("Message must not be empty.");
+    const messagesBeforeRun = structuredClone(this.#messages);
     this.#messages.push({ role: "user", content: userMessage });
 
     const usage = emptyUsage();
     const textParts: string[] = [];
     let toolCalls = 0;
     let reactiveCompactionUsed = false;
+    let receivedAssistant = false;
 
     for (let turns = 1; turns <= this.#maxTurns; turns += 1) {
-      if (isAborted(signal)) throw abortError();
-      this.compact(false);
-      const turn = await this.#model.createMessage({
-        messages: this.#messages,
-        system: this.#system,
-        tools: this.#registry.definitions(),
-        ...(signal === undefined ? {} : { signal }),
-        onText: (delta) => this.#onEvent?.({ type: "text", delta }),
-      });
+      let turn;
+      try {
+        if (isAborted(signal)) throw abortError();
+        this.compact(false);
+        turn = await this.#model.createMessage({
+          messages: this.#messages,
+          system: this.#system,
+          tools: this.#registry.definitions(),
+          ...(signal === undefined ? {} : { signal }),
+          onText: (delta) => this.#onEvent?.({ type: "text", delta }),
+        });
+      } catch (error) {
+        if (!receivedAssistant) this.#messages = messagesBeforeRun;
+        throw error;
+      }
       addUsage(usage, turn.usage);
-      this.#onEvent?.({ type: "usage", usage: { ...usage } });
       this.#messages.push({
         role: "assistant",
         content: turn.content as Anthropic.ContentBlockParam[],
       });
+      receivedAssistant = true;
+      this.#onEvent?.({ type: "usage", usage: { ...usage } });
 
       const turnText = turn.content
         .filter((block): block is Anthropic.TextBlock => block.type === "text")
@@ -156,28 +165,33 @@ export class Agent {
         }
 
         const results: Anthropic.ToolResultBlockParam[] = [];
-        for (const call of calls) {
-          if (isAborted(signal)) throw abortError();
-          toolCalls += 1;
-          this.#onEvent?.({
-            type: "tool_start",
-            id: call.id,
-            input: call.input,
-            name: call.name,
-          });
-          const result = await this.#registry.execute(
-            call.name,
-            call.input,
-            signal,
-          );
-          results.push(toToolResult(call.id, result));
-          this.#onEvent?.({
-            type: "tool_result",
-            id: call.id,
-            isError: result.isError,
-            name: call.name,
-            preview: result.content.slice(0, 160),
-          });
+        try {
+          for (const call of calls) {
+            if (isAborted(signal)) throw abortError();
+            toolCalls += 1;
+            this.#onEvent?.({
+              type: "tool_start",
+              id: call.id,
+              input: call.input,
+              name: call.name,
+            });
+            const result = await this.#registry.execute(
+              call.name,
+              call.input,
+              signal,
+            );
+            results.push(toToolResult(call.id, result));
+            this.#onEvent?.({
+              type: "tool_result",
+              id: call.id,
+              isError: result.isError,
+              name: call.name,
+              preview: result.content.slice(0, 160),
+            });
+          }
+        } catch (error) {
+          this.#completeInterruptedBatch(calls, results, error);
+          throw error;
         }
         this.#messages.push({ role: "user", content: results });
         continue;
@@ -224,6 +238,11 @@ export class Agent {
             const compacted = this.compact(true);
             if (compacted.changed) {
               reactiveCompactionUsed = true;
+              this.#messages.push({
+                role: "user",
+                content:
+                  "The previous response exceeded the context window. Continue from the compacted history and re-inspect anything omitted before acting.",
+              });
               continue;
             }
           }
@@ -265,6 +284,36 @@ export class Agent {
       })),
     });
   }
+
+  #completeInterruptedBatch(
+    calls: Anthropic.ToolUseBlock[],
+    results: Anthropic.ToolResultBlockParam[],
+    error: unknown,
+  ): void {
+    const completed = new Set(results.map((result) => result.tool_use_id));
+    const events: AgentEvent[] = [];
+    const reason = isAbortError(error)
+      ? "Tool execution was cancelled before this call completed."
+      : `Tool batch stopped before this call completed: ${errorMessage(error)}`;
+    for (const call of calls) {
+      if (completed.has(call.id)) continue;
+      results.push({
+        type: "tool_result",
+        tool_use_id: call.id,
+        content: reason,
+        is_error: true,
+      });
+      events.push({
+        type: "tool_result",
+        id: call.id,
+        isError: true,
+        name: call.name,
+        preview: reason,
+      });
+    }
+    this.#messages.push({ role: "user", content: results });
+    for (const event of events) this.#onEvent?.(event);
+  }
 }
 
 function toToolResult(
@@ -291,4 +340,12 @@ function abortError(): Error {
 
 function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted ?? false;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

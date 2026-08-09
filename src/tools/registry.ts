@@ -45,12 +45,16 @@ export class ToolRegistry {
     }
 
     try {
+      throwIfAborted(signal);
       const input = tool.parse(rawInput);
-      await this.#gate.authorize(tool.permission(input));
-      const output = await tool.execute(input, {
+      const context = {
         paths: this.#paths,
         ...(signal === undefined ? {} : { signal }),
-      });
+      };
+      await this.#gate.authorize(await tool.permission(input, context), signal);
+      throwIfAborted(signal);
+      const output = await tool.execute(input, context);
+      throwIfAborted(signal);
       return {
         content: truncateToolResult(
           output.length === 0 ? "(no output)" : output,
@@ -59,7 +63,17 @@ export class ToolRegistry {
       };
     } catch (error) {
       if (signal?.aborted === true) throw error;
-      return { content: errorMessage(error), isError: true };
+      return {
+        content: truncateToolResult(errorMessage(error)),
+        isError: true,
+      };
     }
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted !== true) return;
+  const error = new Error("Tool execution cancelled.");
+  error.name = "AbortError";
+  throw error;
 }

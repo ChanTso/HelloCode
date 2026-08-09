@@ -187,6 +187,10 @@ describe("Agent", () => {
     expect(JSON.stringify(model.requests[1]?.messages)).toContain(
       "HelloCode compacted",
     );
+    expect(model.requests[1]?.messages.at(-1)?.role).toBe("user");
+    expect(model.requests[1]?.messages.at(-1)?.content).toContain(
+      "previous response exceeded",
+    );
   });
 
   it("preserves thinking blocks when returning assistant history", async () => {
@@ -240,6 +244,112 @@ describe("Agent", () => {
     controller.abort();
 
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
+    expect(agent.messages).toEqual([]);
+  });
+
+  it("persists tool pairing before notifying observers of cancellation", async () => {
+    const controller = new AbortController();
+    const tool = echoTool(async () => {
+      controller.abort();
+      const error = new Error("cancelled");
+      error.name = "AbortError";
+      throw error;
+    });
+    const model = new FakeModel([
+      toolTurn(toolCall("cancelled", "echo", { value: "x" })),
+    ]);
+    const agent = await createAgent(model, [tool], (event) => {
+      if (event.type === "tool_result") throw new Error("observer failed");
+    });
+
+    await expect(agent.run("Cancel", controller.signal)).rejects.toThrow(
+      "observer failed",
+    );
+    expect(agent.messages.at(-1)).toMatchObject({
+      role: "user",
+      content: [
+        expect.objectContaining({
+          tool_use_id: "cancelled",
+          is_error: true,
+        }),
+      ],
+    });
+  });
+
+  it("completes every tool result when cancellation interrupts a batch", async () => {
+    const controller = new AbortController();
+    let secondStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const tool = defineTool({
+      definition: {
+        name: "cancel_batch",
+        strict: true,
+        input_schema: {
+          type: "object",
+          properties: { value: { type: "string" } },
+          required: ["value"],
+          additionalProperties: false,
+        },
+      },
+      parse(input) {
+        const object = objectInput(input, ["value"]);
+        return { value: stringField(object, "value") };
+      },
+      permission: () => ({
+        tool: "cancel_batch",
+        kind: "read",
+        detail: "test",
+      }),
+      async execute(input, context) {
+        if (input.value === "first") return "first complete";
+        if (input.value === "third") return "should not run";
+        secondStarted?.();
+        return new Promise<string>((_resolve, reject) => {
+          context.signal?.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("cancelled");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true },
+          );
+        });
+      },
+    });
+    const model = new FakeModel([
+      toolTurn(
+        toolCall("batch-1", "cancel_batch", { value: "first" }),
+        toolCall("batch-2", "cancel_batch", { value: "second" }),
+        toolCall("batch-3", "cancel_batch", { value: "third" }),
+      ),
+    ]);
+    const agent = await createAgent(model, [tool]);
+    const running = agent.run("Cancel midway", controller.signal);
+    await started;
+
+    controller.abort();
+
+    await expect(running).rejects.toMatchObject({ name: "AbortError" });
+    const resultMessage = agent.messages.at(-1);
+    expect(resultMessage?.role).toBe("user");
+    expect(resultMessage?.content).toEqual([
+      {
+        type: "tool_result",
+        tool_use_id: "batch-1",
+        content: "first complete",
+      },
+      expect.objectContaining({
+        tool_use_id: "batch-2",
+        is_error: true,
+      }),
+      expect.objectContaining({
+        tool_use_id: "batch-3",
+        is_error: true,
+      }),
+    ]);
   });
 });
 

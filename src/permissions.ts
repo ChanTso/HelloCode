@@ -8,7 +8,10 @@ export interface PermissionRequest {
   tool: string;
 }
 
-export type ApprovalPrompt = (request: PermissionRequest) => Promise<boolean>;
+export type ApprovalPrompt = (
+  request: PermissionRequest,
+  signal?: AbortSignal,
+) => Promise<boolean>;
 
 export class PermissionDeniedError extends Error {
   constructor(message: string) {
@@ -26,7 +29,10 @@ export class PermissionGate {
     this.#ask = ask;
   }
 
-  async authorize(request: PermissionRequest): Promise<void> {
+  async authorize(
+    request: PermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (this.#mode === "bypass") return;
 
     if (this.#mode === "plan" && request.kind !== "read") {
@@ -39,7 +45,7 @@ export class PermissionGate {
       request.kind === "shell" || request.sensitive === true;
     if (!needsApproval) return;
 
-    if (this.#ask === undefined || !(await this.#ask(request))) {
+    if (this.#ask === undefined || !(await this.#ask(request, signal))) {
       throw new PermissionDeniedError(
         `Permission denied for ${request.tool}: ${request.detail}`,
       );
