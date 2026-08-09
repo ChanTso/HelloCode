@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { WorkspacePaths } from "../src/paths.js";
+import { isSensitivePath, WorkspacePaths } from "../src/paths.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -62,6 +62,17 @@ describe("WorkspacePaths", () => {
     await expect(paths.resolveWrite("escape/new.txt")).rejects.toThrow(
       "outside the workspace",
     );
+  });
+
+  it("recognizes sensitive relative paths without requiring a leading slash", () => {
+    expect(isSensitivePath(".ssh")).toBe(true);
+    expect(isSensitivePath(".ssh/id_ed25519")).toBe(true);
+    expect(isSensitivePath(".envrc")).toBe(true);
+    expect(isSensitivePath(".git/config")).toBe(true);
+    expect(isSensitivePath("config/client.p12")).toBe(true);
+    expect(isSensitivePath("credentials")).toBe(true);
+    expect(isSensitivePath("src/id_user.ts")).toBe(false);
+    expect(isSensitivePath("src/index.ts")).toBe(false);
   });
 });
 

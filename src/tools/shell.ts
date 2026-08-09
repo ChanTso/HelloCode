@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
 
+import { stripTerminalControls } from "../terminal-safety.js";
 import {
   defineTool,
   objectInput,
@@ -53,10 +55,7 @@ export function createShellTool(): ToolSpec {
     permission: (input) => ({
       tool: "run_command",
       kind: "shell",
-      detail:
-        input.command.length > 240
-          ? `${input.command.slice(0, 237)}...`
-          : input.command,
+      detail: input.command,
     }),
     execute: (input, context) =>
       runCommand(
@@ -78,7 +77,7 @@ async function runCommand(
 
   const windows = process.platform === "win32";
   const shell = windows ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh";
-  const args = windows ? ["/d", "/s", "/c", command] : ["-lc", command];
+  const args = windows ? ["/d", "/s", "/c", command] : ["-c", command];
   const child = spawn(shell, args, {
     cwd: workspace,
     detached: !windows,
@@ -94,14 +93,19 @@ async function runCommand(
   child.stderr.on("data", (chunk: string) => stderr.append(chunk));
 
   let timedOut = false;
+  let termination: Promise<void> | undefined;
+  const stop = (): void => {
+    termination ??= terminate(child);
+  };
   const timeout = setTimeout(() => {
     timedOut = true;
-    terminate(child);
+    stop();
   }, timeoutMs);
   timeout.unref();
 
-  const onAbort = (): void => terminate(child);
+  const onAbort = (): void => stop();
   signal?.addEventListener("abort", onAbort, { once: true });
+  if (isAborted(signal)) onAbort();
 
   try {
     const result = await new Promise<{
@@ -130,6 +134,7 @@ async function runCommand(
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
+    if (termination !== undefined) await termination;
   }
 }
 
@@ -144,7 +149,7 @@ class BoundedText {
   }
 
   append(chunk: string): void {
-    const clean = sanitizeTerminalText(chunk);
+    const clean = stripTerminalControls(chunk);
     if (this.#head.length < this.#half) {
       const needed = this.#half - this.#head.length;
       this.#head += clean.slice(0, needed);
@@ -171,43 +176,58 @@ class BoundedText {
   }
 }
 
-function terminate(child: ChildProcess): void {
-  if (child.pid === undefined || child.exitCode !== null) return;
+async function terminate(child: ChildProcess): Promise<void> {
+  if (!isRunning(child)) return;
+  const pid = child.pid;
   try {
-    if (process.platform === "win32") child.kill("SIGTERM");
-    else process.kill(-child.pid, "SIGTERM");
+    if (process.platform === "win32") void killWindowsTree(pid, false);
+    else process.kill(-pid, "SIGTERM");
   } catch {
     child.kill("SIGTERM");
   }
 
-  const force = setTimeout(() => {
-    if (child.exitCode !== null || child.pid === undefined) return;
-    try {
-      if (process.platform === "win32") child.kill("SIGKILL");
-      else process.kill(-child.pid, "SIGKILL");
-    } catch {
-      child.kill("SIGKILL");
-    }
-  }, 1500);
-  force.unref();
+  await delay(500);
+  try {
+    if (process.platform === "win32") await killWindowsTree(pid, true);
+    else process.kill(-pid, "SIGKILL");
+  } catch {
+    if (isRunning(child)) child.kill("SIGKILL");
+  }
+}
+
+function isRunning(
+  child: ChildProcess,
+): child is ChildProcess & { pid: number } {
+  return (
+    child.pid !== undefined &&
+    child.exitCode === null &&
+    child.signalCode === null
+  );
+}
+
+function killWindowsTree(pid: number, force: boolean): Promise<void> {
+  const systemRoot =
+    process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+  const executable = path.join(systemRoot, "System32", "taskkill.exe");
+  const killer = spawn(
+    executable,
+    ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])],
+    { env: commandEnvironment(), stdio: "ignore", windowsHide: true },
+  );
+  return new Promise((resolve) => {
+    killer.once("error", () => resolve());
+    killer.once("close", () => resolve());
+  });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function commandEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   delete environment.ANTHROPIC_API_KEY;
   return environment;
-}
-
-function sanitizeTerminalText(text: string): string {
-  return (
-    text
-      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-      .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, "")
-      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-      .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
-      // eslint-disable-next-line no-control-regex -- terminal control characters are the subject of this sanitizer.
-      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
-  );
 }
 
 function abortError(): Error {

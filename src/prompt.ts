@@ -1,12 +1,15 @@
-import { readFile } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 
-import type { WorkspacePaths } from "./paths.js";
+import { isSensitivePath, type WorkspacePaths } from "./paths.js";
 
 const MAX_PROJECT_INSTRUCTIONS = 24_000;
+const MAX_PROJECT_INSTRUCTION_BYTES = MAX_PROJECT_INSTRUCTIONS * 4;
 
 export async function buildSystemPrompt(
   paths: WorkspacePaths,
+  planMode = false,
 ): Promise<string> {
   const sections = [
     `You are HelloCode, a practical coding agent working in ${paths.root}.`,
@@ -18,6 +21,12 @@ export async function buildSystemPrompt(
       "Keep the final response concise: lead with the outcome, name meaningful changes, report checks, and state any real blocker.",
     ].join("\n"),
   ];
+
+  if (planMode) {
+    sections.push(
+      "Plan mode is active. Inspect and explain only; do not call edit_file, write_file, or run_command.",
+    );
+  }
 
   const projectInstructions = await readProjectInstructions(paths);
   if (projectInstructions !== undefined) {
@@ -34,10 +43,38 @@ async function readProjectInstructions(
 ): Promise<string | undefined> {
   const instructionPath = path.join(paths.root, "AGENTS.md");
   try {
+    const lexicalStat = await lstat(instructionPath);
+    if (lexicalStat.isSymbolicLink() || !lexicalStat.isFile()) return undefined;
     const resolved = await paths.resolveExisting(instructionPath);
-    const content = await readFile(resolved, "utf8");
-    if (content.length <= MAX_PROJECT_INSTRUCTIONS) return content;
-    return `${content.slice(0, MAX_PROJECT_INSTRUCTIONS)}\n\n[AGENTS.md truncated by HelloCode]`;
+    if (isSensitivePath(resolved) || isSensitivePath(paths.display(resolved))) {
+      return undefined;
+    }
+    const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+    const handle = await open(resolved, fsConstants.O_RDONLY | noFollow);
+    try {
+      const buffer = Buffer.alloc(MAX_PROJECT_INSTRUCTION_BYTES + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const chunk = await handle.read(
+          buffer,
+          bytesRead,
+          buffer.length - bytesRead,
+          bytesRead,
+        );
+        if (chunk.bytesRead === 0) break;
+        bytesRead += chunk.bytesRead;
+      }
+      const content = buffer.subarray(0, bytesRead).toString("utf8");
+      if (
+        bytesRead <= MAX_PROJECT_INSTRUCTION_BYTES &&
+        content.length <= MAX_PROJECT_INSTRUCTIONS
+      ) {
+        return content;
+      }
+      return `${content.slice(0, MAX_PROJECT_INSTRUCTIONS)}\n\n[AGENTS.md truncated by HelloCode]`;
+    } finally {
+      await handle.close();
+    }
   } catch (error) {
     if (
       error instanceof Error &&

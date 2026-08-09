@@ -1,19 +1,24 @@
 import { randomUUID } from "node:crypto";
 import {
+  access,
   chmod,
+  link,
   lstat,
   mkdir,
+  open,
   readdir,
-  readFile,
+  realpath,
   rename,
   stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { isSensitivePath } from "../paths.js";
+import { stripTerminalControls } from "../terminal-safety.js";
 import {
   defineTool,
   objectInput,
@@ -22,12 +27,17 @@ import {
   optionalStringField,
   stringField,
   type ToolSpec,
+  type ToolContext,
 } from "./types.js";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_WRITE_BYTES = 2 * 1024 * 1024;
+const MAX_EDIT_REPLACEMENTS = 100_000;
 const MAX_LIST_RESULTS = 500;
 const MAX_SEARCH_RESULTS = 200;
+const MAX_SCANNED_FILES = 50_000;
+const MAX_GLOB_CHARS = 1024;
+const SEARCH_TIMEOUT_MS = 120_000;
 const IGNORED_DIRECTORIES = new Set([
   ".git",
   "node_modules",
@@ -42,18 +52,23 @@ interface ReadInput {
   limit: number;
   offset: number;
   path: string;
+  resolvedPath?: string;
 }
 
 interface ListInput {
+  includeSensitive?: boolean;
   path: string;
   pattern: string;
+  resolvedPath?: string;
 }
 
 interface SearchInput {
+  includeSensitive?: boolean;
   path: string;
   pattern?: string;
   query: string;
   regex: boolean;
+  resolvedPath?: string;
 }
 
 interface EditInput {
@@ -61,12 +76,15 @@ interface EditInput {
   oldText: string;
   path: string;
   replaceAll: boolean;
+  resolvedPath?: string;
 }
 
 interface WriteInput {
   content: string;
+  createMode?: number;
   overwrite: boolean;
   path: string;
+  resolvedPath?: string;
 }
 
 export function createFileTools(): ToolSpec[] {
@@ -117,23 +135,26 @@ const readFileTool = defineTool<ReadInput>({
       limit: optionalIntegerField(value, "limit", 1, 2000) ?? 400,
     };
   },
-  permission: (input) => ({
-    tool: "read_file",
-    kind: "read",
-    detail: input.path,
-    sensitive: isSensitivePath(input.path),
-  }),
+  async permission(input, context) {
+    input.resolvedPath = await context.paths.resolveExisting(input.path);
+    const display = context.paths.display(input.resolvedPath);
+    const sensitive =
+      isSensitivePath(input.resolvedPath) || isSensitivePath(display);
+    return {
+      tool: "read_file",
+      kind: "read",
+      detail: display,
+      sensitive,
+    };
+  },
   async execute(input, context) {
-    const filePath = await context.paths.resolveExisting(input.path);
-    const fileStat = await stat(filePath);
-    if (!fileStat.isFile()) throw new Error(`Not a file: ${input.path}`);
-    if (fileStat.size > MAX_FILE_BYTES) {
-      throw new Error(
-        `File is too large (${fileStat.size} bytes; limit ${MAX_FILE_BYTES}).`,
-      );
-    }
-
-    const text = decodeText(await readFile(filePath), input.path);
+    const filePath = await confirmExistingPath(input, context);
+    const { buffer } = await readRegularFile(
+      filePath,
+      input.path,
+      MAX_FILE_BYTES,
+    );
+    const text = decodeText(buffer, input.path);
     const lines = text.split("\n");
     const start = input.offset - 1;
     if (start >= lines.length) {
@@ -179,26 +200,39 @@ const listFilesTool = defineTool<ListInput>({
   },
   parse(input) {
     const value = objectInput(input, ["path", "pattern"]);
-    return {
+    const parsed = {
       path: optionalStringField(value, "path") ?? ".",
       pattern: optionalStringField(value, "pattern") ?? "**/*",
     };
+    validateGlob(parsed.pattern);
+    return parsed;
   },
-  permission: (input) => ({
-    tool: "list_files",
-    kind: "read",
-    detail: `${input.path} (${input.pattern})`,
-  }),
+  async permission(input, context) {
+    input.resolvedPath = await context.paths.resolveExisting(input.path);
+    const display = context.paths.display(input.resolvedPath);
+    input.includeSensitive =
+      isSensitivePath(input.resolvedPath) ||
+      isSensitivePath(display) ||
+      isSensitivePath(input.pattern);
+    return {
+      tool: "list_files",
+      kind: "read",
+      detail: `${display} (${input.pattern})`,
+      sensitive: input.includeSensitive,
+    };
+  },
   async execute(input, context) {
-    const startPath = await context.paths.resolveExisting(input.path);
-    const matcher = globToRegExp(input.pattern);
+    const startPath = await confirmExistingPath(input, context);
     const files = await walkFiles(startPath, context.signal);
     const matches: string[] = [];
 
     for (const file of files) {
       const relativeToStart = toPosix(path.relative(startPath, file));
-      if (!matcher.test(relativeToStart)) continue;
-      matches.push(toPosix(context.paths.display(file)));
+      if (!globMatches(input.pattern, relativeToStart)) continue;
+      const workspaceRelative = toPosix(context.paths.display(file));
+      if (!input.includeSensitive && isSensitivePath(workspaceRelative))
+        continue;
+      matches.push(workspaceRelative);
       if (matches.length === MAX_LIST_RESULTS) break;
     }
 
@@ -216,7 +250,7 @@ const searchTextTool = defineTool<SearchInput>({
   definition: {
     name: "search_text",
     description:
-      "Search UTF-8 files in the workspace. Uses fast ripgrep when available and falls back to a built-in search. Literal search is the default; set regex for regular expressions.",
+      "Search UTF-8 files in the workspace. Literal search uses ripgrep when available and has a built-in fallback; regular expressions require ripgrep.",
     strict: true,
     input_schema: {
       type: "object",
@@ -252,23 +286,29 @@ const searchTextTool = defineTool<SearchInput>({
       regex: optionalBooleanField(value, "regex") ?? false,
     };
     const pattern = optionalStringField(value, "pattern");
-    if (pattern !== undefined) result.pattern = pattern;
-    if (result.regex) new RegExp(result.query, "u");
+    if (pattern !== undefined) {
+      validateGlob(pattern);
+      result.pattern = pattern;
+    }
     return result;
   },
-  permission: (input) => ({
-    tool: "search_text",
-    kind: "read",
-    detail: `${input.query} in ${input.path}`,
-    sensitive:
-      isSensitivePath(input.path) ||
-      (input.pattern !== undefined && isSensitivePath(input.pattern)),
-  }),
-  async execute(input, context) {
-    const searchPath = await context.paths.resolveExisting(input.path);
-    const includeSensitive =
-      isSensitivePath(input.path) ||
+  async permission(input, context) {
+    input.resolvedPath = await context.paths.resolveExisting(input.path);
+    const display = context.paths.display(input.resolvedPath);
+    input.includeSensitive =
+      isSensitivePath(input.resolvedPath) ||
+      isSensitivePath(display) ||
       (input.pattern !== undefined && isSensitivePath(input.pattern));
+    return {
+      tool: "search_text",
+      kind: "read",
+      detail: `${input.query} in ${display}${input.pattern === undefined ? "" : ` (${input.pattern})`}`,
+      sensitive: input.includeSensitive,
+    };
+  },
+  async execute(input, context) {
+    const searchPath = await confirmExistingPath(input, context);
+    const includeSensitive = input.includeSensitive ?? false;
     const rgResult = await searchWithRipgrep(
       input,
       searchPath,
@@ -277,6 +317,9 @@ const searchTextTool = defineTool<SearchInput>({
       context.signal,
     );
     if (rgResult !== undefined) return rgResult;
+    if (input.regex) {
+      throw new Error("Regex search requires ripgrep (rg) to be installed.");
+    }
     return searchWithNode(
       input,
       searchPath,
@@ -327,21 +370,32 @@ const editFileTool = defineTool<EditInput>({
       replaceAll: optionalBooleanField(value, "replace_all") ?? false,
     };
   },
-  permission: (input) => ({
-    tool: "edit_file",
-    kind: "write",
-    detail: input.path,
-    sensitive: isSensitivePath(input.path),
-  }),
+  async permission(input, context) {
+    input.resolvedPath = await context.paths.resolveWrite(input.path);
+    const display = context.paths.display(input.resolvedPath);
+    const sensitive =
+      isSensitivePath(input.resolvedPath) || isSensitivePath(display);
+    return {
+      tool: "edit_file",
+      kind: "write",
+      detail: display,
+      sensitive,
+    };
+  },
   async execute(input, context) {
-    const filePath = await context.paths.resolveWrite(input.path);
-    const fileStat = await stat(filePath).catch(() => {
-      throw new Error(`File does not exist: ${input.path}`);
+    const filePath = await confirmWritePath(input, context);
+    const originalFile = await readRegularFile(
+      filePath,
+      input.path,
+      MAX_FILE_BYTES,
+    ).catch((error: unknown) => {
+      if (isErrno(error, "ENOENT")) {
+        throw new Error(`File does not exist: ${input.path}`);
+      }
+      throw error;
     });
-    if (!fileStat.isFile()) throw new Error(`Not a file: ${input.path}`);
-    if (fileStat.size > MAX_FILE_BYTES)
-      throw new Error("File is too large to edit.");
-    const original = decodeText(await readFile(filePath), input.path);
+    const originalBuffer = originalFile.buffer;
+    const original = decodeText(originalBuffer, input.path);
     const occurrences = countOccurrences(original, input.oldText);
     if (occurrences === 0) throw new Error("old_text was not found.");
     if (!input.replaceAll && occurrences !== 1) {
@@ -349,10 +403,33 @@ const editFileTool = defineTool<EditInput>({
         `old_text occurs ${occurrences} times; provide a larger unique match or set replace_all.`,
       );
     }
+    if (input.replaceAll && occurrences > MAX_EDIT_REPLACEMENTS) {
+      throw new Error(
+        `replace_all matched ${occurrences} times; limit ${MAX_EDIT_REPLACEMENTS}. Use a more specific edit.`,
+      );
+    }
+    const replacements = input.replaceAll ? occurrences : 1;
+    const projectedBytes =
+      originalBuffer.byteLength -
+      replacements * Buffer.byteLength(input.oldText) +
+      replacements * Buffer.byteLength(input.newText);
+    if (projectedBytes > MAX_FILE_BYTES) {
+      throw new Error(
+        `Edit would create a ${projectedBytes}-byte file; limit ${MAX_FILE_BYTES}.`,
+      );
+    }
     const updated = input.replaceAll
-      ? original.split(input.oldText).join(input.newText)
-      : original.replace(input.oldText, input.newText);
-    await atomicWrite(filePath, updated, fileStat.mode);
+      ? original.replaceAll(input.oldText, () => input.newText)
+      : original.replace(input.oldText, () => input.newText);
+    if (Buffer.byteLength(updated) > MAX_FILE_BYTES) {
+      throw new Error(`Edited file exceeds the ${MAX_FILE_BYTES}-byte limit.`);
+    }
+    const current = await readRegularFile(filePath, input.path, MAX_FILE_BYTES);
+    if (!current.buffer.equals(originalBuffer)) {
+      throw new Error(`File changed while it was being edited: ${input.path}`);
+    }
+    throwIfAborted(context.signal);
+    await atomicWrite(filePath, updated, originalFile.mode, context.signal);
     return `Updated ${input.path} (${input.replaceAll ? occurrences : 1} replacement${occurrences === 1 ? "" : "s"}).`;
   },
 });
@@ -393,14 +470,21 @@ const writeFileTool = defineTool<WriteInput>({
       overwrite: optionalBooleanField(value, "overwrite") ?? false,
     };
   },
-  permission: (input) => ({
-    tool: "write_file",
-    kind: "write",
-    detail: input.path,
-    sensitive: isSensitivePath(input.path),
-  }),
+  async permission(input, context) {
+    input.resolvedPath = await context.paths.resolveWrite(input.path);
+    const display = context.paths.display(input.resolvedPath);
+    const sensitive =
+      isSensitivePath(input.resolvedPath) || isSensitivePath(display);
+    input.createMode = sensitive ? 0o600 : 0o666;
+    return {
+      tool: "write_file",
+      kind: "write",
+      detail: display,
+      sensitive,
+    };
+  },
   async execute(input, context) {
-    const filePath = await context.paths.resolveWrite(input.path);
+    const filePath = await confirmWritePath(input, context);
     const existing = await lstat(filePath).catch((error: unknown) => {
       if (isErrno(error, "ENOENT")) return undefined;
       throw error;
@@ -412,9 +496,45 @@ const writeFileTool = defineTool<WriteInput>({
     }
     if (existing?.isDirectory() === true)
       throw new Error(`Path is a directory: ${input.path}`);
+    throwIfAborted(context.signal);
     await mkdir(path.dirname(filePath), { recursive: true });
-    await atomicWrite(filePath, input.content, existing?.mode ?? 0o644);
-    return `${existing === undefined ? "Created" : "Wrote"} ${input.path} (${Buffer.byteLength(input.content)} bytes).`;
+    await confirmWritePath(input, context);
+    throwIfAborted(context.signal);
+    let created = existing === undefined;
+    if (existing === undefined) {
+      try {
+        await atomicCreate(
+          filePath,
+          input.content,
+          input.createMode ?? 0o666,
+          context.signal,
+        );
+      } catch (error) {
+        if (!isErrno(error, "EEXIST")) throw error;
+        if (!input.overwrite) {
+          throw new Error(
+            `File appeared while it was being created: ${input.path}.`,
+            { cause: error },
+          );
+        }
+        const raced = await lstat(filePath);
+        if (raced.isSymbolicLink()) {
+          throw new Error(
+            `Refusing to overwrite a symbolic link: ${input.path}`,
+            { cause: error },
+          );
+        }
+        if (raced.isDirectory())
+          throw new Error(`Path is a directory: ${input.path}`, {
+            cause: error,
+          });
+        created = false;
+        await atomicWrite(filePath, input.content, raced.mode, context.signal);
+      }
+    } else {
+      await atomicWrite(filePath, input.content, existing.mode, context.signal);
+    }
+    return `${created ? "Created" : "Wrote"} ${input.path} (${Buffer.byteLength(input.content)} bytes).`;
   },
 });
 
@@ -441,6 +561,11 @@ async function walkFiles(
         if (!IGNORED_DIRECTORIES.has(entry.name)) pending.push(entryPath);
       } else if (entry.isFile()) {
         files.push(entryPath);
+        if (files.length >= MAX_SCANNED_FILES) {
+          throw new Error(
+            `Workspace scan exceeded ${MAX_SCANNED_FILES} files; use a narrower path.`,
+          );
+        }
       }
     }
   }
@@ -454,7 +579,10 @@ async function searchWithRipgrep(
   includeSensitive: boolean,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  const executable = await findRipgrep(workspace);
+  if (executable === undefined) return undefined;
   const args = [
+    "--no-config",
     "--line-number",
     "--no-heading",
     "--color=never",
@@ -464,40 +592,80 @@ async function searchWithRipgrep(
   if (input.pattern !== undefined) args.push("--glob", input.pattern);
   args.push(
     "--glob",
-    "!.git/**",
+    "!**/node_modules/**",
     "--glob",
-    "!node_modules/**",
+    "!**/dist/**",
     "--glob",
-    "!dist/**",
+    "!**/build/**",
+    "--glob",
+    "!**/coverage/**",
+    "--glob",
+    "!**/.next/**",
+    "--glob",
+    "!**/.turbo/**",
   );
   if (!includeSensitive) {
     args.push(
-      "--glob",
-      "!**/.env",
-      "--glob",
-      "!**/.env.*",
-      "--glob",
+      "--iglob",
+      "!**/.git/**",
+      "--iglob",
+      "!**/.env*",
+      "--iglob",
       "!**/*.pem",
-      "--glob",
+      "--iglob",
       "!**/*.key",
-      "--glob",
+      "--iglob",
       "!**/.npmrc",
+      "--iglob",
+      "!**/.pypirc",
+      "--iglob",
+      "!**/.netrc",
+      "--iglob",
+      "!**/.ssh/**",
+      "--iglob",
+      "!**/credential",
+      "--iglob",
+      "!**/credentials",
+      "--iglob",
+      "!**/credentials.*",
+      "--iglob",
+      "!**/id_rsa",
+      "--iglob",
+      "!**/id_dsa",
+      "--iglob",
+      "!**/id_ecdsa",
+      "--iglob",
+      "!**/id_ed25519",
+      "--iglob",
+      "!**/*.p12",
+      "--iglob",
+      "!**/*.pfx",
     );
   }
   args.push("--", input.query, path.relative(workspace, searchPath) || ".");
 
   return new Promise((resolve, reject) => {
-    const child = spawn("rg", args, {
+    const child = spawn(executable, args, {
       cwd: workspace,
       env: sanitizedEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let abortForce: NodeJS.Timeout | undefined;
     const onAbort = (): void => {
       child.kill("SIGTERM");
+      abortForce ??= setTimeout(() => child.kill("SIGKILL"), 1500);
+      abortForce.unref();
     };
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, SEARCH_TIMEOUT_MS);
+    timeout.unref();
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -507,13 +675,21 @@ async function searchWithRipgrep(
       if (stderr.length < 20_000) stderr += chunk;
     });
     child.once("error", (error: NodeJS.ErrnoException) => {
+      clearTimeout(timeout);
+      if (abortForce !== undefined) clearTimeout(abortForce);
       signal?.removeEventListener("abort", onAbort);
       if (error.code === "ENOENT") resolve(undefined);
       else reject(error);
     });
     child.once("close", (code) => {
+      clearTimeout(timeout);
+      if (abortForce !== undefined) clearTimeout(abortForce);
       signal?.removeEventListener("abort", onAbort);
       if (signal?.aborted === true) return reject(abortError());
+      if (timedOut)
+        return reject(
+          new Error(`ripgrep timed out after ${SEARCH_TIMEOUT_MS} ms.`),
+        );
       if (code === 1) return resolve("No matches.");
       if (code !== 0)
         return reject(
@@ -521,7 +697,7 @@ async function searchWithRipgrep(
             stderr.trim() || `ripgrep exited with code ${String(code)}`,
           ),
         );
-      const lines = sanitizeText(stdout).trimEnd().split("\n");
+      const lines = stripTerminalControls(stdout).trimEnd().split("\n");
       const limited = lines.slice(0, MAX_SEARCH_RESULTS);
       const suffix =
         lines.length > MAX_SEARCH_RESULTS
@@ -539,9 +715,6 @@ async function searchWithNode(
   includeSensitive: boolean,
   signal?: AbortSignal,
 ): Promise<string> {
-  const matcher =
-    input.pattern === undefined ? undefined : globToRegExp(input.pattern);
-  const query = input.regex ? new RegExp(input.query, "u") : undefined;
   const files = await walkFiles(searchPath, signal);
   const matches: string[] = [];
 
@@ -549,20 +722,25 @@ async function searchWithNode(
     if (signal?.aborted === true) throw abortError();
     const workspaceRelative = toPosix(path.relative(workspace, file));
     const searchRelative = toPosix(path.relative(searchPath, file));
-    if (matcher !== undefined && !matcher.test(searchRelative)) continue;
+    if (
+      input.pattern !== undefined &&
+      !globMatches(input.pattern, searchRelative)
+    )
+      continue;
     if (!includeSensitive && isSensitivePath(workspaceRelative)) continue;
-    const fileStat = await stat(file);
-    if (fileStat.size > MAX_FILE_BYTES) continue;
     let text: string;
     try {
-      text = decodeText(await readFile(file), workspaceRelative);
+      const { buffer } = await readRegularFile(
+        file,
+        workspaceRelative,
+        MAX_FILE_BYTES,
+      );
+      text = decodeText(buffer, workspaceRelative);
     } catch {
       continue;
     }
     for (const [index, line] of text.split("\n").entries()) {
-      const matched =
-        query === undefined ? line.includes(input.query) : query.test(line);
-      if (query !== undefined) query.lastIndex = 0;
+      const matched = line.includes(input.query);
       if (matched) matches.push(`${workspaceRelative}:${index + 1}:${line}`);
       if (matches.length === MAX_SEARCH_RESULTS) {
         return `${matches.join("\n")}\n[Results limited to ${MAX_SEARCH_RESULTS}; narrow the query to see more.]`;
@@ -582,19 +760,108 @@ function decodeText(buffer: Buffer, label: string): string {
   }
 }
 
+async function confirmExistingPath(
+  input: { path: string; resolvedPath?: string },
+  context: ToolContext,
+): Promise<string> {
+  const current = await context.paths.resolveExisting(input.path);
+  assertAuthorizedPath(input.resolvedPath, current);
+  input.resolvedPath = current;
+  return current;
+}
+
+async function confirmWritePath(
+  input: { path: string; resolvedPath?: string },
+  context: ToolContext,
+): Promise<string> {
+  const current = await context.paths.resolveWrite(input.path);
+  assertAuthorizedPath(input.resolvedPath, current);
+  input.resolvedPath = current;
+  return current;
+}
+
+function assertAuthorizedPath(
+  authorized: string | undefined,
+  current: string,
+): void {
+  if (authorized !== undefined && authorized !== current) {
+    throw new Error("Path changed after authorization; retry the operation.");
+  }
+}
+
+async function readRegularFile(
+  filePath: string,
+  label: string,
+  maximumBytes: number,
+): Promise<{ buffer: Buffer; mode: number }> {
+  const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+  const handle = await open(filePath, fsConstants.O_RDONLY | noFollow);
+  try {
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile()) throw new Error(`Not a file: ${label}`);
+    if (fileStat.size > maximumBytes) {
+      throw new Error(
+        `File is too large (${fileStat.size} bytes; limit ${maximumBytes}).`,
+      );
+    }
+    const capacity = Math.min(maximumBytes + 1, fileStat.size + 1);
+    const buffer = Buffer.alloc(capacity);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(
+        buffer,
+        bytesRead,
+        buffer.length - bytesRead,
+        bytesRead,
+      );
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
+    if (bytesRead > fileStat.size) {
+      throw new Error(`File changed while it was being read: ${label}`);
+    }
+    return { buffer: buffer.subarray(0, bytesRead), mode: fileStat.mode };
+  } finally {
+    await handle.close();
+  }
+}
+
 async function atomicWrite(
   filePath: string,
   content: string,
   mode: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const temporary = path.join(
     path.dirname(filePath),
     `.${path.basename(filePath)}.hellocode-${process.pid}-${randomUUID()}.tmp`,
   );
   try {
+    throwIfAborted(signal);
     await writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode });
     await chmod(temporary, mode);
+    throwIfAborted(signal);
     await rename(temporary, filePath);
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function atomicCreate(
+  filePath: string,
+  content: string,
+  mode: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const temporary = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.hellocode-${process.pid}-${randomUUID()}.tmp`,
+  );
+  try {
+    throwIfAborted(signal);
+    await writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode });
+    throwIfAborted(signal);
+    await link(temporary, filePath);
   } finally {
     await unlink(temporary).catch(() => undefined);
   }
@@ -610,47 +877,146 @@ function countOccurrences(text: string, search: string): number {
   return count;
 }
 
-function globToRegExp(glob: string): RegExp {
-  let source = "^";
-  for (let index = 0; index < glob.length; index += 1) {
-    const character = glob[index];
-    if (character === "*") {
-      if (glob[index + 1] === "*") {
-        index += 1;
-        if (glob[index + 1] === "/") {
-          index += 1;
-          source += "(?:.*/)?";
-        } else {
-          source += ".*";
+type GlobToken =
+  | { kind: "literal"; value: string }
+  | { kind: "one" | "star" | "tree" | "tree_directory" };
+
+function globMatches(glob: string, candidate: string): boolean {
+  const value = toPosix(candidate);
+  let states = Array<boolean>(value.length + 1).fill(false);
+  states[0] = true;
+
+  for (const token of tokenizeGlob(glob)) {
+    const next = Array<boolean>(value.length + 1).fill(false);
+    switch (token.kind) {
+      case "literal":
+        for (let index = 0; index < value.length; index += 1) {
+          if (states[index] && value[index] === token.value)
+            next[index + 1] = true;
         }
-      } else {
-        source += "[^/]*";
+        break;
+      case "one":
+        for (let index = 0; index < value.length; index += 1) {
+          if (states[index] && value[index] !== "/") next[index + 1] = true;
+        }
+        break;
+      case "star":
+        for (let index = 0; index <= value.length; index += 1) {
+          if (states[index]) next[index] = true;
+          if (index > 0 && next[index - 1] && value[index - 1] !== "/")
+            next[index] = true;
+        }
+        break;
+      case "tree":
+        for (let index = 0; index <= value.length; index += 1) {
+          if (states[index] || (index > 0 && next[index - 1]))
+            next[index] = true;
+        }
+        break;
+      case "tree_directory": {
+        next[0] = states[0] ?? false;
+        let reachable = states[0] ?? false;
+        for (let index = 1; index <= value.length; index += 1) {
+          if (states[index - 1]) reachable = true;
+          if (states[index] || (reachable && value[index - 1] === "/"))
+            next[index] = true;
+        }
+        break;
       }
-    } else if (character === "?") {
-      source += "[^/]";
-    } else {
-      source += character?.replace(/[|\\{}()[\]^$+?.]/g, "\\$&") ?? "";
     }
+    states = next;
   }
-  return new RegExp(`${source}$`, "u");
+
+  return states[value.length] ?? false;
 }
 
-function sanitizeText(text: string): string {
-  return (
-    text
-      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-      .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, "")
-      // eslint-disable-next-line no-control-regex -- terminal escape sequences are the subject of this sanitizer.
-      .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
-      // eslint-disable-next-line no-control-regex -- terminal control characters are the subject of this sanitizer.
-      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
-  );
+function tokenizeGlob(glob: string): GlobToken[] {
+  const normalized = glob.replaceAll("\\", "/");
+  const tokens: GlobToken[] = [];
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index];
+    if (character === "?") {
+      tokens.push({ kind: "one" });
+      continue;
+    }
+    if (character !== "*") {
+      tokens.push({ kind: "literal", value: character ?? "" });
+      continue;
+    }
+
+    let end = index + 1;
+    while (normalized[end] === "*") end += 1;
+    if (end - index === 1) {
+      tokens.push({ kind: "star" });
+    } else if (normalized[end] === "/") {
+      tokens.push({ kind: "tree_directory" });
+      end += 1;
+    } else {
+      tokens.push({ kind: "tree" });
+    }
+    index = end - 1;
+  }
+  return tokens;
+}
+
+function validateGlob(glob: string): void {
+  if (glob.length > MAX_GLOB_CHARS) {
+    throw new TypeError(
+      `pattern exceeds the ${MAX_GLOB_CHARS}-character glob limit.`,
+    );
+  }
 }
 
 function sanitizedEnvironment(): NodeJS.ProcessEnv {
-  const environment = { ...process.env };
-  delete environment.ANTHROPIC_API_KEY;
+  const environment: NodeJS.ProcessEnv = {};
+  for (const name of [
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+  ]) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
   return environment;
+}
+
+async function findRipgrep(workspace: string): Promise<string | undefined> {
+  const pathValue = process.env.PATH;
+  if (pathValue === undefined) return undefined;
+  const executableNames =
+    process.platform === "win32" ? ["rg.exe", "rg"] : ["rg"];
+
+  for (const entry of pathValue.split(path.delimiter)) {
+    const directory = path.resolve(entry === "" ? process.cwd() : entry);
+    for (const name of executableNames) {
+      try {
+        const candidate = await realpath(path.join(directory, name));
+        if (isWithin(workspace, candidate)) continue;
+        const candidateStat = await stat(candidate);
+        if (!candidateStat.isFile()) continue;
+        await access(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch {
+        // Continue through PATH entries until a usable executable is found.
+      }
+    }
+  }
+  return undefined;
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`))
+  );
 }
 
 function toPosix(value: string): string {
@@ -669,4 +1035,8 @@ function abortError(): Error {
   const error = new Error("Operation cancelled.");
   error.name = "AbortError";
   return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted === true) throw abortError();
 }

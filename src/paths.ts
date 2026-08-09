@@ -26,9 +26,15 @@ export class WorkspacePaths {
 
   async resolveExisting(inputPath: string): Promise<string> {
     const candidate = this.#resolveLexically(inputPath);
-    const canonical = await realpath(candidate).catch(() => {
-      throw new WorkspaceBoundaryError(`Path does not exist: ${inputPath}`);
-    });
+    let canonical: string;
+    try {
+      canonical = await realpath(candidate);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        throw new WorkspaceBoundaryError(`Path does not exist: ${inputPath}`);
+      }
+      throw error;
+    }
     this.#assertInside(canonical, inputPath);
     return canonical;
   }
@@ -45,7 +51,7 @@ export class WorkspacePaths {
       }
       const canonical = await realpath(candidate);
       this.#assertInside(canonical, inputPath);
-      return candidate;
+      return canonical;
     } catch (error) {
       if (error instanceof WorkspaceBoundaryError) throw error;
       if (!isMissingPathError(error)) throw error;
@@ -56,7 +62,12 @@ export class WorkspacePaths {
       try {
         const canonicalAncestor = await realpath(ancestor);
         this.#assertInside(canonicalAncestor, inputPath);
-        return candidate;
+        const canonicalCandidate = path.resolve(
+          canonicalAncestor,
+          path.relative(ancestor, candidate),
+        );
+        this.#assertInside(canonicalCandidate, inputPath);
+        return canonicalCandidate;
       } catch (error) {
         if (!isMissingPathError(error)) throw error;
         const parent = path.dirname(ancestor);
@@ -100,18 +111,25 @@ export class WorkspacePaths {
 
 export function isSensitivePath(filePath: string): boolean {
   const normalized = filePath.replaceAll("\\", "/").toLowerCase();
+  const segments = normalized.split("/").filter((segment) => segment !== "");
   const basename = path.posix.basename(normalized);
+  const gitIndex = segments.lastIndexOf(".git");
   return (
-    basename === ".env" ||
-    basename.startsWith(".env.") ||
+    basename.startsWith(".env") ||
     basename === ".npmrc" ||
     basename === ".pypirc" ||
+    basename === "credential" ||
     basename === "credentials" ||
-    basename.includes("credential") ||
+    basename.startsWith("credentials.") ||
     basename.endsWith(".pem") ||
     basename.endsWith(".key") ||
-    normalized.includes("/.ssh/") ||
-    normalized.endsWith("/.git/config")
+    basename === ".netrc" ||
+    ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].includes(basename) ||
+    basename.endsWith(".p12") ||
+    basename.endsWith(".pfx") ||
+    segments.includes(".ssh") ||
+    (gitIndex !== -1 &&
+      (gitIndex === segments.length - 1 || segments[gitIndex + 1] === "config"))
   );
 }
 
