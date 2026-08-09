@@ -1,0 +1,67 @@
+import type Anthropic from '@anthropic-ai/sdk';
+
+import type { PermissionGate } from '../permissions.js';
+import type { WorkspacePaths } from '../paths.js';
+import {
+  errorMessage,
+  truncateToolResult,
+  type ToolSpec,
+} from './types.js';
+
+export interface ToolExecutionResult {
+  content: string;
+  isError: boolean;
+}
+
+export class ToolRegistry {
+  readonly #gate: PermissionGate;
+  readonly #paths: WorkspacePaths;
+  readonly #tools: Map<string, ToolSpec>;
+
+  constructor(
+    tools: readonly ToolSpec[],
+    paths: WorkspacePaths,
+    gate: PermissionGate,
+  ) {
+    this.#paths = paths;
+    this.#gate = gate;
+    this.#tools = new Map();
+    for (const tool of tools) {
+      if (this.#tools.has(tool.definition.name)) {
+        throw new Error(`Duplicate tool name: ${tool.definition.name}`);
+      }
+      this.#tools.set(tool.definition.name, tool);
+    }
+  }
+
+  definitions(): Anthropic.Tool[] {
+    return [...this.#tools.values()].map((tool) => tool.definition);
+  }
+
+  async execute(
+    name: string,
+    rawInput: unknown,
+    signal?: AbortSignal,
+  ): Promise<ToolExecutionResult> {
+    const tool = this.#tools.get(name);
+    if (tool === undefined) {
+      return { content: `Unknown tool: ${name}`, isError: true };
+    }
+
+    try {
+      const input = tool.parse(rawInput);
+      await this.#gate.authorize(tool.permission(input));
+      const output = await tool.execute(input, {
+        paths: this.#paths,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      return {
+        content: truncateToolResult(output.length === 0 ? '(no output)' : output),
+        isError: false,
+      };
+    } catch (error) {
+      if (signal?.aborted === true) throw error;
+      return { content: errorMessage(error), isError: true };
+    }
+  }
+}
