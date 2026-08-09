@@ -35,6 +35,8 @@ const MAX_WRITE_BYTES = 2 * 1024 * 1024;
 const MAX_EDIT_REPLACEMENTS = 100_000;
 const MAX_LIST_RESULTS = 500;
 const MAX_SEARCH_RESULTS = 200;
+const MAX_SEARCH_LINE_PREVIEW = 4000;
+const MAX_RIPGREP_RECORD_CHARS = 128 * 1024;
 const MAX_SCANNED_FILES = 50_000;
 const MAX_GLOB_CHARS = 1024;
 const SEARCH_TIMEOUT_MS = 120_000;
@@ -223,13 +225,19 @@ const listFilesTool = defineTool<ListInput>({
   },
   async execute(input, context) {
     const startPath = await confirmExistingPath(input, context);
-    const files = await walkFiles(startPath, context.signal);
+    const files = await walkFiles(
+      startPath,
+      context.signal,
+      input.includeSensitive ?? false,
+    );
     const matches: string[] = [];
 
     for (const file of files) {
       const relativeToStart = toPosix(path.relative(startPath, file));
       if (!globMatches(input.pattern, relativeToStart)) continue;
       const workspaceRelative = toPosix(context.paths.display(file));
+      if (isIgnoredWorkspacePath(workspaceRelative, input.includeSensitive))
+        continue;
       if (!input.includeSensitive && isSensitivePath(workspaceRelative))
         continue;
       matches.push(workspaceRelative);
@@ -541,6 +549,7 @@ const writeFileTool = defineTool<WriteInput>({
 async function walkFiles(
   root: string,
   signal?: AbortSignal,
+  includeSensitive = false,
 ): Promise<string[]> {
   const rootStat = await stat(root);
   if (rootStat.isFile()) return [root];
@@ -558,7 +567,12 @@ async function walkFiles(
       if (entry.isSymbolicLink()) continue;
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
-        if (!IGNORED_DIRECTORIES.has(entry.name)) pending.push(entryPath);
+        if (
+          !IGNORED_DIRECTORIES.has(entry.name) ||
+          (includeSensitive && entry.name === ".git")
+        ) {
+          pending.push(entryPath);
+        }
       } else if (entry.isFile()) {
         files.push(entryPath);
         if (files.length >= MAX_SCANNED_FILES) {
@@ -583,13 +597,21 @@ async function searchWithRipgrep(
   if (executable === undefined) return undefined;
   const args = [
     "--no-config",
+    "--hidden",
+    "--no-ignore",
     "--line-number",
     "--no-heading",
+    "--with-filename",
     "--color=never",
+    "--null",
+    `--max-columns=${MAX_SEARCH_LINE_PREVIEW}`,
+    "--max-columns-preview",
     "--max-filesize=8M",
   ];
   if (!input.regex) args.push("--fixed-strings");
-  if (input.pattern !== undefined) args.push("--glob", input.pattern);
+  if (input.pattern !== undefined && (await stat(searchPath)).isDirectory()) {
+    args.push("--glob", ripgrepPrefilter(input.pattern, searchPath, workspace));
+  }
   args.push(
     "--glob",
     "!**/node_modules/**",
@@ -650,10 +672,57 @@ async function searchWithRipgrep(
       env: sanitizedEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
     let stderr = "";
+    let pending = "";
+    const matches: string[] = [];
+    let limited = false;
+    let outputError: Error | undefined;
     let timedOut = false;
     let abortForce: NodeJS.Timeout | undefined;
+    let limitForce: NodeJS.Timeout | undefined;
+    const addRecord = (pathText: string, record: string): void => {
+      const match = formatRipgrepMatch(
+        pathText,
+        record,
+        input,
+        searchPath,
+        workspace,
+        includeSensitive,
+      );
+      if (match === undefined) return;
+      matches.push(match);
+      if (matches.length > MAX_SEARCH_RESULTS) {
+        matches.length = MAX_SEARCH_RESULTS;
+        limited = true;
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM");
+          limitForce = setTimeout(() => child.kill("SIGKILL"), 1500);
+          limitForce.unref();
+        }
+      }
+    };
+    const consume = (chunk: string): void => {
+      if (limited || outputError !== undefined) return;
+      pending += chunk;
+      while (true) {
+        const separator = pending.indexOf("\0");
+        if (separator === -1) break;
+        const newline = pending.indexOf("\n", separator + 1);
+        if (newline === -1) break;
+        addRecord(
+          pending.slice(0, separator),
+          pending.slice(separator + 1, newline),
+        );
+        pending = pending.slice(newline + 1);
+        if (limited) return;
+      }
+      if (pending.length > MAX_RIPGREP_RECORD_CHARS) {
+        outputError = new Error("ripgrep produced an oversized output record.");
+        child.kill("SIGTERM");
+        limitForce ??= setTimeout(() => child.kill("SIGKILL"), 1500);
+        limitForce.unref();
+      }
+    };
     const onAbort = (): void => {
       child.kill("SIGTERM");
       abortForce ??= setTimeout(() => child.kill("SIGKILL"), 1500);
@@ -668,15 +737,14 @@ async function searchWithRipgrep(
     if (signal?.aborted === true) onAbort();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      if (stdout.length < 1_000_000) stdout += chunk;
-    });
+    child.stdout.on("data", consume);
     child.stderr.on("data", (chunk: string) => {
       if (stderr.length < 20_000) stderr += chunk;
     });
     child.once("error", (error: NodeJS.ErrnoException) => {
       clearTimeout(timeout);
       if (abortForce !== undefined) clearTimeout(abortForce);
+      if (limitForce !== undefined) clearTimeout(limitForce);
       signal?.removeEventListener("abort", onAbort);
       if (error.code === "ENOENT") resolve(undefined);
       else reject(error);
@@ -684,12 +752,29 @@ async function searchWithRipgrep(
     child.once("close", (code) => {
       clearTimeout(timeout);
       if (abortForce !== undefined) clearTimeout(abortForce);
+      if (limitForce !== undefined) clearTimeout(limitForce);
       signal?.removeEventListener("abort", onAbort);
       if (signal?.aborted === true) return reject(abortError());
       if (timedOut)
         return reject(
           new Error(`ripgrep timed out after ${SEARCH_TIMEOUT_MS} ms.`),
         );
+      if (outputError !== undefined) return reject(outputError);
+      if (limited) {
+        return resolve(
+          `${matches.join("\n")}\n[Results limited to ${MAX_SEARCH_RESULTS}; narrow the query to see more.]`,
+        );
+      }
+      if (pending.length > 0) {
+        const separator = pending.indexOf("\0");
+        if (separator === -1) {
+          return reject(new Error("ripgrep produced malformed output."));
+        }
+        addRecord(
+          pending.slice(0, separator),
+          pending.slice(separator + 1).replace(/\n$/u, ""),
+        );
+      }
       if (code === 1) return resolve("No matches.");
       if (code !== 0)
         return reject(
@@ -697,15 +782,50 @@ async function searchWithRipgrep(
             stderr.trim() || `ripgrep exited with code ${String(code)}`,
           ),
         );
-      const lines = stripTerminalControls(stdout).trimEnd().split("\n");
-      const limited = lines.slice(0, MAX_SEARCH_RESULTS);
-      const suffix =
-        lines.length > MAX_SEARCH_RESULTS
-          ? `\n[Results limited to ${MAX_SEARCH_RESULTS}; narrow the query to see more.]`
-          : "";
-      return resolve(`${limited.join("\n")}${suffix}`);
+      return resolve(matches.length === 0 ? "No matches." : matches.join("\n"));
     });
   });
+}
+
+function formatRipgrepMatch(
+  pathText: string,
+  record: string,
+  input: SearchInput,
+  searchPath: string,
+  workspace: string,
+  includeSensitive: boolean,
+): string | undefined {
+  const separator = record.indexOf(":");
+  if (separator < 1) return undefined;
+  const lineNumber = Number(record.slice(0, separator));
+  if (!Number.isSafeInteger(lineNumber) || lineNumber < 1) return undefined;
+
+  const absolutePath = path.resolve(workspace, pathText);
+  if (!isWithin(workspace, absolutePath)) return undefined;
+  if (absolutePath !== searchPath && !isWithin(searchPath, absolutePath)) {
+    return undefined;
+  }
+  const workspaceRelative = toPosix(path.relative(workspace, absolutePath));
+  if (
+    !includeSensitive &&
+    (isSensitivePath(absolutePath) || isSensitivePath(workspaceRelative))
+  ) {
+    return undefined;
+  }
+  const searchRelative =
+    absolutePath === searchPath
+      ? path.basename(absolutePath)
+      : toPosix(path.relative(searchPath, absolutePath));
+  if (
+    input.pattern !== undefined &&
+    !globMatches(input.pattern, searchRelative)
+  ) {
+    return undefined;
+  }
+  const content = stripTerminalControls(
+    record.slice(separator + 1).replace(/\r$/u, ""),
+  );
+  return `${workspaceRelative}:${String(lineNumber)}:${content}`;
 }
 
 async function searchWithNode(
@@ -715,18 +835,22 @@ async function searchWithNode(
   includeSensitive: boolean,
   signal?: AbortSignal,
 ): Promise<string> {
-  const files = await walkFiles(searchPath, signal);
+  const files = await walkFiles(searchPath, signal, includeSensitive);
   const matches: string[] = [];
 
   for (const file of files) {
     if (signal?.aborted === true) throw abortError();
     const workspaceRelative = toPosix(path.relative(workspace, file));
-    const searchRelative = toPosix(path.relative(searchPath, file));
+    const searchRelative =
+      file === searchPath
+        ? path.basename(file)
+        : toPosix(path.relative(searchPath, file));
     if (
       input.pattern !== undefined &&
       !globMatches(input.pattern, searchRelative)
     )
       continue;
+    if (isIgnoredWorkspacePath(workspaceRelative, includeSensitive)) continue;
     if (!includeSensitive && isSensitivePath(workspaceRelative)) continue;
     let text: string;
     try {
@@ -741,8 +865,13 @@ async function searchWithNode(
     }
     for (const [index, line] of text.split("\n").entries()) {
       const matched = line.includes(input.query);
-      if (matched) matches.push(`${workspaceRelative}:${index + 1}:${line}`);
-      if (matches.length === MAX_SEARCH_RESULTS) {
+      if (matched) {
+        matches.push(
+          `${workspaceRelative}:${index + 1}:${previewSearchLine(line)}`,
+        );
+      }
+      if (matches.length > MAX_SEARCH_RESULTS) {
+        matches.length = MAX_SEARCH_RESULTS;
         return `${matches.join("\n")}\n[Results limited to ${MAX_SEARCH_RESULTS}; narrow the query to see more.]`;
       }
     }
@@ -967,6 +1096,53 @@ function validateGlob(glob: string): void {
   }
 }
 
+function ripgrepPrefilter(
+  glob: string,
+  searchPath: string,
+  workspace: string,
+): string {
+  const pattern = translateRipgrepGlob(glob);
+  const searchRoot = toPosix(path.relative(workspace, searchPath));
+  const root =
+    searchRoot === "" ? "" : `/${escapeRipgrepGlobLiteral(searchRoot)}`;
+  if (pattern === undefined) return `${root}/**`;
+  return `${root}/${pattern}`;
+}
+
+function translateRipgrepGlob(glob: string): string | undefined {
+  const normalized = glob.replaceAll("\\", "/");
+  let translated = "";
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index] ?? "";
+    if (character === "*") {
+      let end = index + 1;
+      while (normalized[end] === "*") end += 1;
+      if (end - index === 1) {
+        translated += "*";
+      } else {
+        const leftIsBoundary = index === 0 || normalized[index - 1] === "/";
+        const rightIsBoundary =
+          end === normalized.length || normalized[end] === "/";
+        // ripgrep only gives ** recursive meaning at path-component boundaries.
+        if (!leftIsBoundary || !rightIsBoundary) return undefined;
+        translated += "**";
+      }
+      index = end - 1;
+      continue;
+    }
+    translated += "![]{}".includes(character) ? `\\${character}` : character;
+  }
+  return translated;
+}
+
+function escapeRipgrepGlobLiteral(value: string): string {
+  let escaped = "";
+  for (const character of value) {
+    escaped += "*?![]{}\\".includes(character) ? `\\${character}` : character;
+  }
+  return escaped;
+}
+
 function sanitizedEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const name of [
@@ -1029,6 +1205,26 @@ function isErrno(error: unknown, code: string): boolean {
     "code" in error &&
     (error as NodeJS.ErrnoException).code === code
   );
+}
+
+function previewSearchLine(line: string): string {
+  const sanitized = stripTerminalControls(line.replace(/\r$/u, ""));
+  if (sanitized.length <= MAX_SEARCH_LINE_PREVIEW) return sanitized;
+  return `${sanitized.slice(0, MAX_SEARCH_LINE_PREVIEW)} [... omitted end of long line]`;
+}
+
+function isIgnoredWorkspacePath(
+  workspaceRelative: string,
+  includeSensitive = false,
+): boolean {
+  return workspaceRelative
+    .split("/")
+    .slice(0, -1)
+    .some(
+      (component) =>
+        IGNORED_DIRECTORIES.has(component) &&
+        !(includeSensitive && component === ".git"),
+    );
 }
 
 function abortError(): Error {

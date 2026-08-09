@@ -162,6 +162,146 @@ describe("file tools", () => {
     expect(searched.content).not.toContain("node_modules");
   });
 
+  it("uses the same glob and hidden-file semantics with or without ripgrep", async () => {
+    await mkdir(path.join(directory, "src/nested"), { recursive: true });
+    await mkdir(path.join(directory, "src[1]"), { recursive: true });
+    await mkdir(path.join(directory, ".github"), { recursive: true });
+    await writeFile(path.join(directory, "src/root.ts"), "parity-needle\n");
+    await writeFile(
+      path.join(directory, "src/nested/deep.ts"),
+      "parity-needle\n",
+    );
+    await writeFile(
+      path.join(directory, ".github/workflow.ts"),
+      "parity-needle\n",
+    );
+    await writeFile(
+      path.join(directory, "src[1]/root[1].ts"),
+      "special-needle\n",
+    );
+
+    const shallow = await registry.execute("search_text", {
+      path: "src",
+      query: "parity-needle",
+      pattern: "*.ts",
+    });
+    const hidden = await registry.execute("search_text", {
+      path: ".",
+      query: "parity-needle",
+      pattern: ".github/*.ts",
+    });
+    const special = await registry.execute("search_text", {
+      path: "src[1]",
+      query: "special-needle",
+      pattern: "root[1].ts",
+    });
+    const previousPath = process.env.PATH;
+    let fallbackShallow;
+    let fallbackHidden;
+    let fallbackSpecial;
+    try {
+      process.env.PATH = "";
+      fallbackShallow = await registry.execute("search_text", {
+        path: "src",
+        query: "parity-needle",
+        pattern: "*.ts",
+      });
+      fallbackHidden = await registry.execute("search_text", {
+        path: ".",
+        query: "parity-needle",
+        pattern: ".github/*.ts",
+      });
+      fallbackSpecial = await registry.execute("search_text", {
+        path: "src[1]",
+        query: "special-needle",
+        pattern: "root[1].ts",
+      });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    expect(shallow.content).toContain("src/root.ts:1:parity-needle");
+    expect(shallow.content).not.toContain("nested/deep.ts");
+    expect(hidden.content).toContain(".github/workflow.ts:1:parity-needle");
+    expect(special.content).toContain("src[1]/root[1].ts:1:special-needle");
+    expect(fallbackShallow.content).toBe(shallow.content);
+    expect(fallbackHidden.content).toBe(hidden.content);
+    expect(fallbackSpecial.content).toBe(special.content);
+  });
+
+  it("reports matches on long lines without retaining the whole line", async () => {
+    await writeFile(
+      path.join(directory, "long.ts"),
+      `${"x".repeat(150_000)}needle${"y".repeat(150_000)}\n`,
+    );
+
+    const accelerated = await registry.execute("search_text", {
+      path: ".",
+      query: "needle",
+      pattern: "*.ts",
+    });
+    const previousPath = process.env.PATH;
+    let fallback;
+    try {
+      process.env.PATH = "";
+      fallback = await registry.execute("search_text", {
+        path: ".",
+        query: "needle",
+        pattern: "*.ts",
+      });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    expect(accelerated.content).toContain("long.ts:1:");
+    expect(fallback.content).toContain("long.ts:1:");
+    expect(accelerated.content.length).toBeLessThan(5000);
+    expect(fallback.content.length).toBeLessThan(5000);
+  });
+
+  it("searches an explicit CRLF file with consistent output", async () => {
+    await writeFile(path.join(directory, "single.ts"), "needle\r\n");
+
+    const result = await registry.execute("search_text", {
+      path: "single.ts",
+      query: "needle",
+    });
+
+    expect(result).toEqual({
+      isError: false,
+      content: "single.ts:1:needle",
+    });
+  });
+
+  it("keeps non-component recursive globs conservative in ripgrep", async () => {
+    await mkdir(path.join(directory, "a/x"), { recursive: true });
+    await writeFile(path.join(directory, "a/x/b"), "tree-needle\n");
+
+    const accelerated = await registry.execute("search_text", {
+      path: ".",
+      query: "tree-needle",
+      pattern: "a**b",
+    });
+    const previousPath = process.env.PATH;
+    let fallback;
+    try {
+      process.env.PATH = "";
+      fallback = await registry.execute("search_text", {
+        path: ".",
+        query: "tree-needle",
+        pattern: "a**b",
+      });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    expect(accelerated.content).toBe("a/x/b:1:tree-needle");
+    expect(fallback.content).toBe(accelerated.content);
+  });
+
   it("filters sensitive files from broad listing and search", async () => {
     await writeFile(path.join(directory, "safe.txt"), "needle\n");
     await writeFile(path.join(directory, "credentials"), "needle secret\n");
@@ -169,6 +309,8 @@ describe("file tools", () => {
     await writeFile(path.join(directory, "CLIENT.PEM"), "needle key\n");
     await writeFile(path.join(directory, "ID_ED25519"), "needle ssh\n");
     await writeFile(path.join(directory, ".env"), "needle hidden\n");
+    await mkdir(path.join(directory, ".git"), { recursive: true });
+    await writeFile(path.join(directory, ".git/config"), "needle git\n");
 
     const listed = await registry.execute("list_files", {
       path: ".",
@@ -185,12 +327,14 @@ describe("file tools", () => {
     expect(listed.content).not.toContain("CLIENT.PEM");
     expect(listed.content).not.toContain("ID_ED25519");
     expect(listed.content).not.toContain(".env");
+    expect(listed.content).not.toContain(".git/config");
     expect(searched.content).toContain("safe.txt");
     expect(searched.content).not.toContain("credentials");
     expect(searched.content).not.toContain("CREDENTIALS");
     expect(searched.content).not.toContain("CLIENT.PEM");
     expect(searched.content).not.toContain("ID_ED25519");
     expect(searched.content).not.toContain(".env");
+    expect(searched.content).not.toContain(".git/config");
   });
 
   it("authorizes the canonical target of a sensitive symlink", async () => {
@@ -346,6 +490,25 @@ describe("file tools", () => {
     expect(approve.mock.calls[0]?.[0].detail).toContain("**/*.key");
   });
 
+  it("searches an approved sensitive directory with the Node fallback", async () => {
+    await mkdir(path.join(directory, ".git"), { recursive: true });
+    await writeFile(path.join(directory, ".git/config"), "approved needle\n");
+    const previousPath = process.env.PATH;
+    try {
+      process.env.PATH = "";
+      const result = await registry.execute("search_text", {
+        path: ".",
+        query: "needle",
+        pattern: ".git/config",
+      });
+
+      expect(result.content).toContain(".git/config:1:approved needle");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   it("matches adversarial glob patterns without regex backtracking", async () => {
     await writeFile(path.join(directory, "a".repeat(32)), "content");
     const started = performance.now();
@@ -371,8 +534,15 @@ describe("file tools", () => {
         [
           "#!/bin/sh",
           'case " $* " in *" --no-config "*) ;; *) exit 9 ;; esac',
+          'case " $* " in *" --null "*) ;; *) exit 11 ;; esac',
+          'case " $* " in *" --hidden "*) ;; *) exit 12 ;; esac',
+          'case " $* " in *" --no-ignore "*) ;; *) exit 13 ;; esac',
+          'case " $* " in *" --max-columns=4000 "*) ;; *) exit 14 ;; esac',
+          'case " $* " in *" --max-columns-preview "*) ;; *) exit 15 ;; esac',
+          'case " $* " in *" --with-filename "*) ;; *) exit 16 ;; esac',
+          'found_glob=""; previous=""; for argument in "$@"; do if [ "$previous" = "--glob" ] && [ "$argument" = "/*.ts" ]; then found_glob=1; fi; previous="$argument"; done; [ "$found_glob" = 1 ] || exit 17',
           'if [ -n "${RIPGREP_CONFIG_PATH:-}" ]; then exit 10; fi',
-          "printf 'safe.ts:1:needle\\n'",
+          "printf 'safe.ts\\000%s\\n' '1:needle'",
           "",
         ].join("\n"),
       );
@@ -383,6 +553,7 @@ describe("file tools", () => {
       const result = await registry.execute("search_text", {
         path: ".",
         query: "needle",
+        pattern: "*.ts",
       });
 
       expect(result).toEqual({
@@ -471,16 +642,20 @@ describe("run_command", () => {
 
   it("does not pass the Anthropic API key to child processes", async () => {
     const previous = process.env.ANTHROPIC_API_KEY;
+    const previousMixedCase = process.env.Anthropic_Api_Key;
     process.env.ANTHROPIC_API_KEY = "must-not-leak";
+    process.env.Anthropic_Api_Key = "must-not-leak-either";
     try {
       const result = await registry.execute("run_command", {
-        command: `${quote(process.execPath)} -e "process.stdout.write(process.env.ANTHROPIC_API_KEY || 'missing')"`,
+        command: `${quote(process.execPath)} -e "process.stdout.write(Object.keys(process.env).some((name) => name.toUpperCase() === 'ANTHROPIC_API_KEY') ? 'leaked' : 'missing')"`,
       });
       expect(result.content).toContain("stdout:\nmissing");
       expect(result.content).not.toContain("must-not-leak");
     } finally {
       if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = previous;
+      if (previousMixedCase === undefined) delete process.env.Anthropic_Api_Key;
+      else process.env.Anthropic_Api_Key = previousMixedCase;
     }
   });
 

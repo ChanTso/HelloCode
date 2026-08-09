@@ -226,7 +226,11 @@ function delay(milliseconds: number): Promise<void> {
 
 function commandEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env };
-  delete environment.ANTHROPIC_API_KEY;
+  for (const name of Object.keys(environment)) {
+    if (name.toUpperCase() === "ANTHROPIC_API_KEY") {
+      delete environment[name];
+    }
+  }
   return environment;
 }
 
