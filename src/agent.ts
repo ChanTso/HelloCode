@@ -1,5 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 
+import { ContextManager, type CompactResult } from './context.js';
 import {
   addUsage,
   emptyUsage,
@@ -25,7 +26,12 @@ export type AgentEvent =
       name: string;
       preview: string;
     }
-  | { type: 'usage'; usage: TokenUsage };
+  | { type: 'usage'; usage: TokenUsage }
+  | {
+      type: 'context_compacted';
+      removedTurns: number;
+      shortenedResults: number;
+    };
 
 export interface AgentRunResult {
   stop: AgentStop;
@@ -36,6 +42,7 @@ export interface AgentRunResult {
 }
 
 export interface AgentOptions {
+  context?: ContextManager;
   maxToolCalls?: number;
   maxTurns?: number;
   onEvent?: (event: AgentEvent) => void;
@@ -43,6 +50,7 @@ export interface AgentOptions {
 }
 
 export class Agent {
+  readonly #context: ContextManager;
   readonly #maxToolCalls: number;
   readonly #maxTurns: number;
   readonly #model: ModelClient;
@@ -61,6 +69,7 @@ export class Agent {
     this.#system = options.system;
     this.#maxTurns = options.maxTurns ?? 40;
     this.#maxToolCalls = options.maxToolCalls ?? 100;
+    this.#context = options.context ?? new ContextManager();
     this.#onEvent = options.onEvent;
   }
 
@@ -76,6 +85,19 @@ export class Agent {
     this.#messages = structuredClone(messages);
   }
 
+  compact(force = true): CompactResult {
+    const result = this.#context.compact(this.#messages, force);
+    if (result.changed) {
+      this.#messages = result.messages;
+      this.#onEvent?.({
+        type: 'context_compacted',
+        removedTurns: result.removedTurns,
+        shortenedResults: result.shortenedResults,
+      });
+    }
+    return result;
+  }
+
   async run(userMessage: string, signal?: AbortSignal): Promise<AgentRunResult> {
     if (userMessage.trim() === '') throw new Error('Message must not be empty.');
     this.#messages.push({ role: 'user', content: userMessage });
@@ -86,6 +108,7 @@ export class Agent {
 
     for (let turns = 1; turns <= this.#maxTurns; turns += 1) {
       if (isAborted(signal)) throw abortError();
+      this.compact(false);
       const turn = await this.#model.createMessage({
         messages: this.#messages,
         system: this.#system,
