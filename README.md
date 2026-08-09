@@ -32,7 +32,7 @@ Added request validation and covered the invalid-input path. The focused test su
 Requires Node.js 22 or newer and an [Anthropic API key](https://console.anthropic.com/settings/keys).
 
 ```sh
-npm install --global github:ChanTso/HelloCode
+npm install --global https://github.com/ChanTso/HelloCode/releases/download/v0.1.0/hellocode-agent-0.1.0.tgz
 export ANTHROPIC_API_KEY="your-api-key"
 hellocode
 ```
