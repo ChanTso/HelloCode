@@ -1,11 +1,11 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import type { TranscriptMessage } from "./model.js";
 
 const DEFAULT_MAX_CHARS = 600_000;
 const COMPACTED_RESULT_CHARS = 1200;
 
 export interface CompactResult {
   changed: boolean;
-  messages: Anthropic.MessageParam[];
+  messages: TranscriptMessage[];
   removedTurns: number;
   shortenedResults: number;
 }
@@ -20,21 +20,18 @@ export class ContextManager {
     this.#maxChars = maxChars;
   }
 
-  compact(
-    source: readonly Anthropic.MessageParam[],
-    force = false,
-  ): CompactResult {
+  compact(source: readonly TranscriptMessage[], force = false): CompactResult {
     const originalSize = estimateSize(source);
     if (!force && originalSize <= this.#maxChars) {
       return {
         changed: false,
-        messages: source as Anthropic.MessageParam[],
+        messages: source as TranscriptMessage[],
         removedTurns: 0,
         shortenedResults: 0,
       };
     }
 
-    const messages = structuredClone(source) as Anthropic.MessageParam[];
+    const messages = structuredClone(source) as TranscriptMessage[];
     let shortenedResults = shortenOldToolResults(messages, force);
     let removedTurns = 0;
     const target = force
@@ -68,7 +65,7 @@ export class ContextManager {
 }
 
 function shortenOldToolResults(
-  messages: Anthropic.MessageParam[],
+  messages: TranscriptMessage[],
   force: boolean,
   includeRecent = false,
 ): number {
@@ -79,13 +76,9 @@ function shortenOldToolResults(
 
   for (const [messageIndex, message] of messages.entries()) {
     if (!includeRecent && messageIndex >= lastProtectedIndex) continue;
-    if (!Array.isArray(message.content)) continue;
+    if (message.role !== "tool") continue;
     for (const block of message.content) {
-      if (
-        block.type !== "tool_result" ||
-        typeof block.content !== "string" ||
-        block.content.length <= COMPACTED_RESULT_CHARS
-      ) {
+      if (block.content.length <= COMPACTED_RESULT_CHARS) {
         continue;
       }
       const originalLength = block.content.length;
@@ -96,33 +89,20 @@ function shortenOldToolResults(
   return count;
 }
 
-function naturalTurnStarts(
-  messages: readonly Anthropic.MessageParam[],
-): number[] {
+function naturalTurnStarts(messages: readonly TranscriptMessage[]): number[] {
   const starts: number[] = [];
   for (const [index, message] of messages.entries()) {
-    if (message.role === "user" && !isToolResultOnly(message))
-      starts.push(index);
+    if (message.role === "user") starts.push(index);
   }
   return starts;
 }
 
-function isToolResultOnly(message: Anthropic.MessageParam): boolean {
-  return (
-    Array.isArray(message.content) &&
-    message.content.length > 0 &&
-    message.content.every((block) => block.type === "tool_result")
-  );
-}
-
-function countNaturalTurns(
-  messages: readonly Anthropic.MessageParam[],
-): number {
+function countNaturalTurns(messages: readonly TranscriptMessage[]): number {
   return naturalTurnStarts(messages).length;
 }
 
 function summarizeRemoved(
-  messages: readonly Anthropic.MessageParam[],
+  messages: readonly TranscriptMessage[],
   turns: number,
 ): string {
   const excerpts: string[] = [];
@@ -138,7 +118,7 @@ function summarizeRemoved(
 }
 
 function prependCompactionNote(
-  messages: Anthropic.MessageParam[],
+  messages: TranscriptMessage[],
   note: string,
 ): void {
   const first = messages[0];
@@ -149,14 +129,15 @@ function prependCompactionNote(
   messages.unshift({ role: "user", content: note });
 }
 
-function messageText(message: Anthropic.MessageParam): string {
-  if (typeof message.content === "string") return message.content;
+function messageText(message: TranscriptMessage): string {
+  if (message.role === "user") return message.content;
+  if (message.role === "tool") return "";
   return message.content
-    .filter((block): block is Anthropic.TextBlockParam => block.type === "text")
+    .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join("\n");
 }
 
-function estimateSize(messages: readonly Anthropic.MessageParam[]): number {
+function estimateSize(messages: readonly TranscriptMessage[]): number {
   return JSON.stringify(messages).length;
 }

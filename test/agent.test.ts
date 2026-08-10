@@ -2,11 +2,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type Anthropic from "@anthropic-ai/sdk";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Agent } from "../src/agent.js";
-import type { ModelClient, ModelRequest, ModelTurn } from "../src/model.js";
+import type {
+  ModelClient,
+  ModelRequest,
+  ModelTurn,
+  TranscriptMessage,
+} from "../src/model.js";
 import { WorkspacePaths } from "../src/paths.js";
 import { PermissionGate } from "../src/permissions.js";
 import { ToolRegistry } from "../src/tools/index.js";
@@ -56,12 +60,13 @@ describe("Agent", () => {
     expect(result.toolCalls).toBe(1);
     expect(model.requests).toHaveLength(2);
     const resultMessage = model.requests[1]?.messages[2];
-    expect(resultMessage?.role).toBe("user");
+    expect(resultMessage?.role).toBe("tool");
     expect(resultMessage?.content).toEqual([
       {
         type: "tool_result",
-        tool_use_id: "call-1",
+        toolCallId: "call-1",
         content: "echo:hello",
+        isError: false,
       },
     ]);
   });
@@ -87,12 +92,17 @@ describe("Agent", () => {
     expect(order).toEqual(["good", "bad"]);
     const resultMessage = model.requests[1]?.messages[2];
     expect(resultMessage?.content).toEqual([
-      { type: "tool_result", tool_use_id: "first", content: "ok:good" },
       {
         type: "tool_result",
-        tool_use_id: "second",
+        toolCallId: "first",
+        content: "ok:good",
+        isError: false,
+      },
+      {
+        type: "tool_result",
+        toolCallId: "second",
         content: "broken input",
-        is_error: true,
+        isError: true,
       },
     ]);
   });
@@ -110,9 +120,9 @@ describe("Agent", () => {
     expect(model.requests[1]?.messages[2]?.content).toEqual([
       {
         type: "tool_result",
-        tool_use_id: "missing",
+        toolCallId: "missing",
         content: "Unknown tool: not_registered",
-        is_error: true,
+        isError: true,
       },
     ]);
   });
@@ -136,7 +146,7 @@ describe("Agent", () => {
     expect(result.stop).toBe("max_tokens");
     expect(executed).toBe(false);
     expect(agent.messages.at(-1)?.content).toEqual([
-      expect.objectContaining({ tool_use_id: "partial", is_error: true }),
+      expect.objectContaining({ toolCallId: "partial", isError: true }),
     ]);
   });
 
@@ -151,13 +161,13 @@ describe("Agent", () => {
     expect(result.stop).toBe("turn_limit");
     expect(result.toolCalls).toBe(0);
     expect(agent.messages.at(-1)?.content).toEqual([
-      expect.objectContaining({ tool_use_id: "limited", is_error: true }),
+      expect.objectContaining({ toolCallId: "limited", isError: true }),
     ]);
   });
 
-  it("stops cleanly when pause_turn reaches the configured limit", async () => {
+  it("stops cleanly when a pause reaches the configured turn limit", async () => {
     const model = new FakeModel([
-      { ...textTurn("Still working"), stopReason: "pause_turn" },
+      { ...textTurn("Still working"), stopReason: "pause" },
     ]);
     const agent = await createAgent(model, [], undefined, 1);
 
@@ -169,15 +179,21 @@ describe("Agent", () => {
 
   it("compacts once and retries a context-window stop", async () => {
     const model = new FakeModel([
-      { ...textTurn(""), stopReason: "model_context_window_exceeded" },
+      { ...textTurn(""), stopReason: "context_limit" },
       textTurn("Recovered after compaction."),
     ]);
     const agent = await createAgent(model, []);
     agent.restore([
       { role: "user", content: "Old request one" },
-      { role: "assistant", content: "Old answer one" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Old answer one" }],
+      },
       { role: "user", content: "Old request two" },
-      { role: "assistant", content: "Old answer two" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Old answer two" }],
+      },
     ]);
 
     const result = await agent.run("Current request");
@@ -193,16 +209,26 @@ describe("Agent", () => {
     );
   });
 
-  it("preserves thinking blocks when returning assistant history", async () => {
-    const thinking: Anthropic.ThinkingBlock = {
-      type: "thinking",
-      thinking: "private reasoning summary",
-      signature: "signed",
+  it("preserves opaque replay metadata when returning assistant history", async () => {
+    const replay = {
+      format: "anthropic-content-v1" as const,
+      scope: "anthropic:test-model:default",
+      items: [
+        {
+          type: "thinking",
+          thinking: "private reasoning summary",
+          signature: "signed",
+        },
+      ],
     };
     const call = toolCall("think-call", "echo", { value: "x" });
     const model = new FakeModel([
       {
-        content: [thinking, call],
+        message: {
+          role: "assistant",
+          content: [call],
+          replay,
+        },
         stopReason: "tool_use",
         usage: { input: 1, cacheWrite: 2, cacheRead: 3, output: 4 },
       },
@@ -212,7 +238,11 @@ describe("Agent", () => {
 
     const result = await agent.run("Think and act");
 
-    expect(model.requests[1]?.messages[1]?.content).toEqual([thinking, call]);
+    expect(model.requests[1]?.messages[1]).toEqual({
+      role: "assistant",
+      content: [call],
+      replay,
+    });
     expect(result.usage).toEqual({
       input: 11,
       cacheWrite: 2,
@@ -266,11 +296,11 @@ describe("Agent", () => {
       "observer failed",
     );
     expect(agent.messages.at(-1)).toMatchObject({
-      role: "user",
+      role: "tool",
       content: [
         expect.objectContaining({
-          tool_use_id: "cancelled",
-          is_error: true,
+          toolCallId: "cancelled",
+          isError: true,
         }),
       ],
     });
@@ -285,8 +315,9 @@ describe("Agent", () => {
     const tool = defineTool({
       definition: {
         name: "cancel_batch",
+        description: "Test cancellation across a tool batch.",
         strict: true,
-        input_schema: {
+        inputSchema: {
           type: "object",
           properties: { value: { type: "string" } },
           required: ["value"],
@@ -302,7 +333,7 @@ describe("Agent", () => {
         kind: "read",
         detail: "test",
       }),
-      async execute(input, context) {
+      async execute(input: { value: string }, context) {
         if (input.value === "first") return "first complete";
         if (input.value === "third") return "should not run";
         secondStarted?.();
@@ -334,27 +365,28 @@ describe("Agent", () => {
 
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
     const resultMessage = agent.messages.at(-1);
-    expect(resultMessage?.role).toBe("user");
+    expect(resultMessage?.role).toBe("tool");
     expect(resultMessage?.content).toEqual([
       {
         type: "tool_result",
-        tool_use_id: "batch-1",
+        toolCallId: "batch-1",
         content: "first complete",
+        isError: false,
       },
       expect.objectContaining({
-        tool_use_id: "batch-2",
-        is_error: true,
+        toolCallId: "batch-2",
+        isError: true,
       }),
       expect.objectContaining({
-        tool_use_id: "batch-3",
-        is_error: true,
+        toolCallId: "batch-3",
+        isError: true,
       }),
     ]);
   });
 });
 
 class FakeModel implements ModelClient {
-  readonly requests: Array<{ messages: Anthropic.MessageParam[] }> = [];
+  readonly requests: Array<{ messages: TranscriptMessage[] }> = [];
   readonly #turns: ModelTurn[];
 
   constructor(turns: ModelTurn[]) {
@@ -365,7 +397,7 @@ class FakeModel implements ModelClient {
     this.requests.push({ messages: structuredClone(request.messages) });
     const turn = this.#turns.shift();
     if (turn === undefined) throw new Error("Fake model ran out of responses.");
-    for (const block of turn.content) {
+    for (const block of turn.message.content) {
       if (block.type === "text") request.onText?.(block.text);
     }
     return turn;
@@ -398,7 +430,7 @@ function echoTool(
       name: "echo",
       description: "Echo a value.",
       strict: true,
-      input_schema: {
+      inputSchema: {
         type: "object",
         properties: { value: { type: "string" } },
         required: ["value"],
@@ -416,15 +448,18 @@ function echoTool(
 
 function textTurn(text: string): ModelTurn {
   return {
-    content: [{ type: "text", text, citations: null }],
-    stopReason: "end_turn",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    },
+    stopReason: "complete",
     usage: { input: 10, cacheWrite: 0, cacheRead: 0, output: 4 },
   };
 }
 
-function toolTurn(...calls: Anthropic.ToolUseBlock[]): ModelTurn {
+function toolTurn(...calls: ReturnType<typeof toolCall>[]): ModelTurn {
   return {
-    content: calls,
+    message: { role: "assistant", content: calls },
     stopReason: "tool_use",
     usage: { input: 10, cacheWrite: 0, cacheRead: 0, output: 4 },
   };
@@ -434,6 +469,6 @@ function toolCall(
   id: string,
   name: string,
   input: unknown,
-): Anthropic.ToolUseBlock {
-  return { type: "tool_use", id, name, input, caller: { type: "direct" } };
+): { type: "tool_call"; id: string; name: string; input: unknown } {
+  return { type: "tool_call", id, name, input };
 }

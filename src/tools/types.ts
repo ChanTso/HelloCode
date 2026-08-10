@@ -1,5 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
-
+import type { ToolDefinition } from "../model.js";
 import type { PermissionRequest } from "../permissions.js";
 import type { WorkspacePaths } from "../paths.js";
 
@@ -11,7 +10,7 @@ export interface ToolContext {
 }
 
 export interface ToolSpec {
-  definition: Anthropic.Tool;
+  definition: ToolDefinition;
   execute(input: unknown, context: ToolContext): Promise<string>;
   parse(input: unknown): unknown;
   permission(
@@ -21,7 +20,7 @@ export interface ToolSpec {
 }
 
 interface TypedToolSpec<T> {
-  definition: Anthropic.Tool;
+  definition: ToolDefinition;
   execute(input: T, context: ToolContext): Promise<string>;
   parse(input: unknown): T;
   permission(

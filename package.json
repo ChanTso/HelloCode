@@ -1,6 +1,6 @@
 {
   "name": "hellocode-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A small, practical coding agent for your terminal.",
   "type": "module",
   "bin": {
@@ -28,6 +28,7 @@
     "coding-agent",
     "claude",
     "cli",
+    "openai",
     "typescript"
   ],
   "author": "ChanTso",
@@ -44,7 +45,8 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.116.0"
+    "@anthropic-ai/sdk": "^0.116.0",
+    "openai": "^7.4.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

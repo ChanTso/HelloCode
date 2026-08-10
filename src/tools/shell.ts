@@ -12,6 +12,16 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_CAPTURE_CHARS = 16_000;
+const PRIVATE_PROVIDER_ENV = new Set([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "CLIPROXY_API_KEY",
+  "CLIPROXY_BASE_URL",
+  "HELLOCODE_API_KEY",
+  "HELLOCODE_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+]);
 
 interface CommandInput {
   command: string;
@@ -25,7 +35,7 @@ export function createShellTool(): ToolSpec {
       description:
         "Run one shell command in the workspace. Returns exit code, stdout, and stderr. Use for builds, tests, git, and other project commands. Commands are not OS-sandboxed and normally require user approval.",
       strict: true,
-      input_schema: {
+      inputSchema: {
         type: "object",
         properties: {
           command: {
@@ -227,9 +237,7 @@ function delay(milliseconds: number): Promise<void> {
 function commandEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   for (const name of Object.keys(environment)) {
-    if (name.toUpperCase() === "ANTHROPIC_API_KEY") {
-      delete environment[name];
-    }
+    if (PRIVATE_PROVIDER_ENV.has(name.toUpperCase())) delete environment[name];
   }
   return environment;
 }

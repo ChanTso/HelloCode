@@ -105,7 +105,7 @@ const readFileTool = defineTool<ReadInput>({
     description:
       "Read a UTF-8 text file in the workspace with one-based line pagination. The result includes line numbers. Use offset and limit to continue large files.",
     strict: true,
-    input_schema: {
+    inputSchema: {
       type: "object",
       properties: {
         path: {
@@ -185,7 +185,7 @@ const listFilesTool = defineTool<ListInput>({
     description:
       "List files below a workspace directory. Supports *, **, and ? glob wildcards and skips common generated directories.",
     strict: true,
-    input_schema: {
+    inputSchema: {
       type: "object",
       properties: {
         path: {
@@ -260,7 +260,7 @@ const searchTextTool = defineTool<SearchInput>({
     description:
       "Search UTF-8 files in the workspace. Literal search uses ripgrep when available and has a built-in fallback; regular expressions require ripgrep.",
     strict: true,
-    input_schema: {
+    inputSchema: {
       type: "object",
       properties: {
         query: {
@@ -344,7 +344,7 @@ const editFileTool = defineTool<EditInput>({
     description:
       "Replace exact text in an existing UTF-8 workspace file. By default old_text must occur exactly once; set replace_all only when every occurrence should change.",
     strict: true,
-    input_schema: {
+    inputSchema: {
       type: "object",
       properties: {
         path: { type: "string" },
@@ -448,7 +448,7 @@ const writeFileTool = defineTool<WriteInput>({
     description:
       "Create a UTF-8 file in the workspace. Parent directories are created. Existing files are protected unless overwrite is true; prefer edit_file for small changes.",
     strict: true,
-    input_schema: {
+    inputSchema: {
       type: "object",
       properties: {
         path: { type: "string" },
