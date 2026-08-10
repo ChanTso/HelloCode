@@ -1,5 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
-
+import type { ToolDefinition } from "../model.js";
 import type { PermissionGate } from "../permissions.js";
 import type { WorkspacePaths } from "../paths.js";
 import { errorMessage, truncateToolResult, type ToolSpec } from "./types.js";
@@ -30,7 +29,7 @@ export class ToolRegistry {
     }
   }
 
-  definitions(): Anthropic.Tool[] {
+  definitions(): ToolDefinition[] {
     return [...this.#tools.values()].map((tool) => tool.definition);
   }
 

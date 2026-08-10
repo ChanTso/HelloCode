@@ -585,8 +585,9 @@ describe("file tools", () => {
     const exploding = defineTool({
       definition: {
         name: "explode",
+        description: "Test bounded tool errors.",
         strict: true,
-        input_schema: {
+        inputSchema: {
           type: "object",
           properties: {},
           additionalProperties: false,
@@ -640,22 +641,41 @@ describe("run_command", () => {
     expect(result.content).toContain("stderr:\nerr");
   });
 
-  it("does not pass the Anthropic API key to child processes", async () => {
-    const previous = process.env.ANTHROPIC_API_KEY;
-    const previousMixedCase = process.env.Anthropic_Api_Key;
-    process.env.ANTHROPIC_API_KEY = "must-not-leak";
-    process.env.Anthropic_Api_Key = "must-not-leak-either";
+  it("does not pass provider credentials or endpoints to child processes", async () => {
+    const privateNames = [
+      "Anthropic_Api_Key",
+      "Anthropic_Base_Url",
+      "HelloCode_Api_Key",
+      "HelloCode_Base_Url",
+      "OpenAi_Api_Key",
+      "OpenAi_Base_Url",
+      "CliProxy_Api_Key",
+      "CliProxy_Base_Url",
+    ] as const;
+    const canonicalNames = privateNames.map((name) => name.toUpperCase());
+    const previous = new Map(
+      privateNames.map((name) => [name, process.env[name]] as const),
+    );
+    for (const name of privateNames) {
+      process.env[name] = "private-test-value";
+    }
     try {
+      const probe = [
+        `const blocked = new Set(${JSON.stringify(canonicalNames)})`,
+        "const leaked = Object.keys(process.env).some((name) => blocked.has(name.toUpperCase()))",
+        "process.stdout.write(leaked ? 'leaked' : 'missing')",
+      ].join(";");
       const result = await registry.execute("run_command", {
-        command: `${quote(process.execPath)} -e "process.stdout.write(Object.keys(process.env).some((name) => name.toUpperCase() === 'ANTHROPIC_API_KEY') ? 'leaked' : 'missing')"`,
+        command: `${quote(process.execPath)} -e ${quote(probe)}`,
       });
       expect(result.content).toContain("stdout:\nmissing");
-      expect(result.content).not.toContain("must-not-leak");
+      expect(result.content).not.toContain("private-test-value");
     } finally {
-      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = previous;
-      if (previousMixedCase === undefined) delete process.env.Anthropic_Api_Key;
-      else process.env.Anthropic_Api_Key = previousMixedCase;
+      for (const name of privateNames) {
+        const value = previous.get(name);
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 

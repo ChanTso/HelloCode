@@ -1,10 +1,11 @@
-import type Anthropic from "@anthropic-ai/sdk";
-
 import { ContextManager, type CompactResult } from "./context.js";
 import {
   addUsage,
   emptyUsage,
   type ModelClient,
+  type ToolCallBlock,
+  type ToolResultBlock,
+  type TranscriptMessage,
   type TokenUsage,
 } from "./model.js";
 import type { ToolExecutionResult, ToolRegistry } from "./tools/index.js";
@@ -53,7 +54,7 @@ export class Agent {
   readonly #onEvent: ((event: AgentEvent) => void) | undefined;
   readonly #registry: ToolRegistry;
   readonly #system: string;
-  #messages: Anthropic.MessageParam[] = [];
+  #messages: TranscriptMessage[] = [];
 
   constructor(
     model: ModelClient,
@@ -69,7 +70,7 @@ export class Agent {
     this.#onEvent = options.onEvent;
   }
 
-  get messages(): readonly Anthropic.MessageParam[] {
+  get messages(): readonly TranscriptMessage[] {
     return this.#messages;
   }
 
@@ -77,7 +78,7 @@ export class Agent {
     this.#messages = [];
   }
 
-  restore(messages: Anthropic.MessageParam[]): void {
+  restore(messages: TranscriptMessage[]): void {
     this.#messages = structuredClone(messages);
   }
 
@@ -126,21 +127,18 @@ export class Agent {
         throw error;
       }
       addUsage(usage, turn.usage);
-      this.#messages.push({
-        role: "assistant",
-        content: turn.content as Anthropic.ContentBlockParam[],
-      });
+      this.#messages.push(turn.message);
       receivedAssistant = true;
       this.#onEvent?.({ type: "usage", usage: { ...usage } });
 
-      const turnText = turn.content
-        .filter((block): block is Anthropic.TextBlock => block.type === "text")
+      const turnText = turn.message.content
+        .filter((block) => block.type === "text")
         .map((block) => block.text)
         .join("");
       if (turnText.length > 0) textParts.push(turnText);
 
-      const calls = turn.content.filter(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+      const calls = turn.message.content.filter(
+        (block): block is ToolCallBlock => block.type === "tool_call",
       );
 
       if (turn.stopReason === "tool_use") {
@@ -164,7 +162,7 @@ export class Agent {
           };
         }
 
-        const results: Anthropic.ToolResultBlockParam[] = [];
+        const results: ToolResultBlock[] = [];
         try {
           for (const call of calls) {
             if (isAborted(signal)) throw abortError();
@@ -193,7 +191,7 @@ export class Agent {
           this.#completeInterruptedBatch(calls, results, error);
           throw error;
         }
-        this.#messages.push({ role: "user", content: results });
+        this.#messages.push({ role: "tool", content: results });
         continue;
       }
 
@@ -205,8 +203,7 @@ export class Agent {
       }
 
       switch (turn.stopReason) {
-        case "end_turn":
-        case "stop_sequence":
+        case "complete":
           return {
             stop: "complete",
             text: textParts.join("\n"),
@@ -214,7 +211,7 @@ export class Agent {
             turns,
             usage,
           };
-        case "pause_turn":
+        case "pause":
           if (turns === this.#maxTurns) {
             return {
               stop: "turn_limit",
@@ -233,7 +230,7 @@ export class Agent {
             turns,
             usage,
           };
-        case "model_context_window_exceeded":
+        case "context_limit":
           if (!reactiveCompactionUsed && turns < this.#maxTurns) {
             const compacted = this.compact(true);
             if (compacted.changed) {
@@ -261,10 +258,6 @@ export class Agent {
             turns,
             usage,
           };
-        case null:
-          throw new Error(
-            "Model returned a final message without a stop reason.",
-          );
         default:
           return assertNever(turn.stopReason);
       }
@@ -273,24 +266,24 @@ export class Agent {
     throw new Error("Agent loop ended unexpectedly.");
   }
 
-  #appendSkippedResults(calls: Anthropic.ToolUseBlock[], reason: string): void {
+  #appendSkippedResults(calls: ToolCallBlock[], reason: string): void {
     this.#messages.push({
-      role: "user",
+      role: "tool",
       content: calls.map((call) => ({
         type: "tool_result",
-        tool_use_id: call.id,
+        toolCallId: call.id,
         content: reason,
-        is_error: true,
+        isError: true,
       })),
     });
   }
 
   #completeInterruptedBatch(
-    calls: Anthropic.ToolUseBlock[],
-    results: Anthropic.ToolResultBlockParam[],
+    calls: ToolCallBlock[],
+    results: ToolResultBlock[],
     error: unknown,
   ): void {
-    const completed = new Set(results.map((result) => result.tool_use_id));
+    const completed = new Set(results.map((result) => result.toolCallId));
     const events: AgentEvent[] = [];
     const reason = isAbortError(error)
       ? "Tool execution was cancelled before this call completed."
@@ -299,9 +292,9 @@ export class Agent {
       if (completed.has(call.id)) continue;
       results.push({
         type: "tool_result",
-        tool_use_id: call.id,
+        toolCallId: call.id,
         content: reason,
-        is_error: true,
+        isError: true,
       });
       events.push({
         type: "tool_result",
@@ -311,7 +304,7 @@ export class Agent {
         preview: reason,
       });
     }
-    this.#messages.push({ role: "user", content: results });
+    this.#messages.push({ role: "tool", content: results });
     for (const event of events) this.#onEvent?.(event);
   }
 }
@@ -319,12 +312,12 @@ export class Agent {
 function toToolResult(
   id: string,
   result: ToolExecutionResult,
-): Anthropic.ToolResultBlockParam {
+): ToolResultBlock {
   return {
     type: "tool_result",
-    tool_use_id: id,
+    toolCallId: id,
     content: result.content,
-    ...(result.isError ? { is_error: true } : {}),
+    isError: result.isError,
   };
 }
 

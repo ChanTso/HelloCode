@@ -5,14 +5,24 @@ import type { Readable, Writable } from "node:stream";
 import { Agent, type AgentRunResult } from "./agent.js";
 import {
   AnthropicModel,
-  DEFAULT_MODEL,
-  formatProviderError,
+  DEFAULT_ANTHROPIC_MODEL,
+  formatAnthropicError,
 } from "./anthropic.js";
 import { ContextManager } from "./context.js";
+import {
+  createModelBackend,
+  type ModelBackend,
+  type ModelProvider,
+} from "./model.js";
 import { WorkspacePaths } from "./paths.js";
 import { PermissionGate, type PermissionMode } from "./permissions.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { SessionStore, stripThinkingBlocks } from "./session.js";
+import {
+  DEFAULT_OPENAI_MODEL,
+  formatOpenAIError,
+  OpenAIResponsesModel,
+} from "./responses.js";
+import { SessionStore, stripReplayState } from "./session.js";
 import { createTools, ToolRegistry } from "./tools/index.js";
 import { TerminalUI } from "./ui.js";
 import { VERSION } from "./version.js";
@@ -25,6 +35,8 @@ interface RuntimeIO {
 
 interface CliConfig {
   apiKey: string;
+  backend: ModelBackend;
+  baseUrl?: string;
   contextChars: number;
   continueSession: boolean;
   interactive: boolean;
@@ -32,6 +44,7 @@ interface CliConfig {
   mode: PermissionMode;
   model: string;
   prompt?: string;
+  provider: ModelProvider;
   save: boolean;
   workspace: string;
 }
@@ -46,7 +59,9 @@ Usage:
 Options:
   -p, --print                          Run once and exit
   -c, --continue                       Resume this workspace's latest session
-  -m, --model <id>                     Anthropic model (default: ${DEFAULT_MODEL})
+      --provider <name>                Model provider: anthropic or openai (default: anthropic)
+  -m, --model <id>                     Model ID (provider default when omitted)
+      --base-url <url>                 API root for a compatible endpoint
   -C, --cwd <path>                     Workspace directory (default: current directory)
       --plan                           Read-only mode; deny edits and commands
       --dangerously-skip-permissions   Skip approval prompts (shell is not sandboxed)
@@ -56,8 +71,14 @@ Options:
   -h, --help                           Show help
 
 Environment:
-  ANTHROPIC_API_KEY       Required Anthropic API key
+  HELLOCODE_PROVIDER      Default provider override
   HELLOCODE_MODEL         Default model override
+  HELLOCODE_API_KEY       API key for the selected provider
+  HELLOCODE_BASE_URL      API root for a compatible endpoint
+  ANTHROPIC_API_KEY       Fallback key for the Anthropic provider
+  ANTHROPIC_BASE_URL      Fallback API root for the Anthropic provider
+  OPENAI_API_KEY          Fallback key for the OpenAI provider
+  OPENAI_BASE_URL         Fallback API root for the OpenAI provider
   HELLOCODE_HOME          Session data directory (default: ~/.hellocode)
   HELLOCODE_CONTEXT_CHARS Approximate context budget (default: 600000)
   NO_COLOR                Disable terminal colors
@@ -129,7 +150,9 @@ function parseCli(argv: string[]) {
     options: {
       print: { type: "boolean", short: "p" },
       continue: { type: "boolean", short: "c" },
+      provider: { type: "string" },
       model: { type: "string", short: "m" },
+      "base-url": { type: "string" },
       cwd: { type: "string", short: "C" },
       plan: { type: "boolean" },
       "dangerously-skip-permissions": { type: "boolean" },
@@ -184,9 +207,26 @@ async function resolveConfig(
     throw new Error("A prompt is required in print mode.");
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey === undefined || apiKey.length === 0) {
-    throw new Error("ANTHROPIC_API_KEY is not set.");
+  const provider = parseProvider(
+    values.provider ?? process.env.HELLOCODE_PROVIDER ?? "anthropic",
+  );
+  const providerBaseUrl =
+    provider === "anthropic"
+      ? process.env.ANTHROPIC_BASE_URL
+      : process.env.OPENAI_BASE_URL;
+  const baseUrlValue =
+    values["base-url"] ?? process.env.HELLOCODE_BASE_URL ?? providerBaseUrl;
+  const baseUrl =
+    baseUrlValue === undefined ? undefined : normalizeBaseUrl(baseUrlValue);
+  const providerKey =
+    provider === "anthropic"
+      ? process.env.ANTHROPIC_API_KEY
+      : process.env.OPENAI_API_KEY;
+  const apiKey = process.env.HELLOCODE_API_KEY ?? providerKey;
+  if (apiKey === undefined || apiKey.trim().length === 0) {
+    const fallback =
+      provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+    throw new Error(`HELLOCODE_API_KEY or ${fallback} is not set.`);
   }
 
   const maxTurns = parsePositiveInteger(
@@ -202,13 +242,17 @@ async function resolveConfig(
   if (contextChars < 20_000) {
     throw new Error("HELLOCODE_CONTEXT_CHARS must be at least 20000.");
   }
-  const model = values.model ?? process.env.HELLOCODE_MODEL ?? DEFAULT_MODEL;
+  const defaultModel =
+    provider === "anthropic" ? DEFAULT_ANTHROPIC_MODEL : DEFAULT_OPENAI_MODEL;
+  const model = values.model ?? process.env.HELLOCODE_MODEL ?? defaultModel;
   if (model.trim() === "") {
     throw new Error("Model ID must not be empty.");
   }
 
   return {
     apiKey,
+    backend: createModelBackend(provider, model, baseUrl),
+    ...(baseUrl === undefined ? {} : { baseUrl }),
     contextChars,
     continueSession: values.continue === true,
     interactive,
@@ -221,6 +265,7 @@ async function resolveConfig(
           : "default",
     model,
     ...(prompt === undefined ? {} : { prompt }),
+    provider,
     save: values["no-save"] !== true,
     workspace: path.resolve(values.cwd ?? process.cwd()),
   };
@@ -230,17 +275,25 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
   const paths = await WorkspacePaths.create(config.workspace);
   const sessionStore =
     config.save || config.continueSession
-      ? new SessionStore({ workspace: paths.root, model: config.model })
+      ? new SessionStore({ workspace: paths.root, backend: config.backend })
       : undefined;
   const permission = new PermissionGate(
     config.mode,
     config.interactive ? ui.approve : undefined,
   );
   const registry = new ToolRegistry(createTools(), paths, permission);
-  const model = new AnthropicModel({
-    apiKey: config.apiKey,
-    model: config.model,
-  });
+  const model =
+    config.provider === "anthropic"
+      ? new AnthropicModel({
+          apiKey: config.apiKey,
+          model: config.model,
+          ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
+        })
+      : new OpenAIResponsesModel({
+          apiKey: config.apiKey,
+          model: config.model,
+          ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
+        });
   const agent = new Agent(model, registry, {
     system: await buildSystemPrompt(paths, config.mode === "plan"),
     maxTurns: config.maxTurns,
@@ -253,16 +306,16 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
     if (loaded === undefined)
       ui.notice("No previous session found for this workspace.");
     else {
-      const changedModel = loaded.model !== config.model;
+      const changedBackend = !sameBackend(loaded.backend, config.backend);
       agent.restore(
-        changedModel ? stripThinkingBlocks(loaded.messages) : loaded.messages,
+        changedBackend ? stripReplayState(loaded.messages) : loaded.messages,
       );
       ui.notice(
         `Resumed session from ${new Date(loaded.updatedAt).toLocaleString()}.`,
       );
-      if (changedModel) {
+      if (changedBackend) {
         ui.notice(
-          `Removed model-specific reasoning from ${loaded.model} before continuing with ${config.model}.`,
+          "Removed model-specific replay state before continuing with a different backend.",
         );
       }
     }
@@ -277,7 +330,7 @@ async function run(config: CliConfig, ui: TerminalUI): Promise<number> {
     return result.stop === "complete" ? 0 : 1;
   }
 
-  ui.showHeader(paths.root, config.model, config.mode);
+  ui.showHeader(paths.root, `${config.provider}/${config.model}`, config.mode);
   return interactiveLoop(agent, writableSession, ui);
 }
 
@@ -427,6 +480,63 @@ function parsePositiveInteger(
     throw new Error(`${label} must be an integer between 1 and ${maximum}.`);
   }
   return parsed;
+}
+
+function parseProvider(value: string): ModelProvider {
+  if (value === "anthropic" || value === "openai") return value;
+  throw new Error("Provider must be anthropic or openai.");
+}
+
+function normalizeBaseUrl(value: string): string {
+  if (value.trim().length === 0) throw new Error("Base URL must not be empty.");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Base URL must be a valid HTTP or HTTPS URL.");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Base URL must use HTTP or HTTPS.");
+  }
+  if (
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.href.includes("?") ||
+    url.href.includes("#")
+  ) {
+    throw new Error(
+      "Base URL must not contain credentials, a query, or a fragment.",
+    );
+  }
+  if (url.protocol === "http:" && !isLoopback(url.hostname)) {
+    throw new Error("Base URL must use HTTPS unless it targets loopback.");
+  }
+  return url.toString().replace(/\/+$/u, "");
+}
+
+function isLoopback(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname === "::1"
+  );
+}
+
+function sameBackend(left: ModelBackend, right: ModelBackend): boolean {
+  return (
+    left.provider === right.provider &&
+    left.model === right.model &&
+    left.endpoint === right.endpoint
+  );
+}
+
+function formatProviderError(error: unknown): string {
+  return (
+    formatAnthropicError(error) ??
+    formatOpenAIError(error) ??
+    errorMessage(error)
+  );
 }
 
 function isAbortError(error: unknown): boolean {
